@@ -5390,19 +5390,14 @@ class ServerArgs:
             help="Enable debug mode for torch compile",
         )
         parser.add_argument(
-            "--enable-piecewise-cuda-graph",
-            action="store_true",
-            help="Optimize the model with piecewise cuda graph for extend/prefill only.",
-        )
-        parser.add_argument(
             "--disable-piecewise-cuda-graph",
             action="store_true",
             help="Disable piecewise cuda graph for extend/prefill.",
         )
         parser.add_argument(
             "--enable-piecewise-cuda-graph",
-            action=DeprecatedAction,
-            help="Deprecated: Piecewise cuda graph is enabled by default. Use --enforce-piecewise-cuda-graph to skip auto-disable conditions.",
+            action="store_true",
+            help="Optimize the model with piecewise cuda graph for extend/prefill only.",
         )
         parser.add_argument(
             "--enforce-piecewise-cuda-graph",
