@@ -993,6 +993,7 @@ def enable_batch_invariant_mode(
             _original_torch_bmm = torch.bmm
             torch.bmm = bmm_batch_invariant
     else:
+        import batch_invariant_ops
         _batch_invariant_LIB.impl(
             "aten::mm", torch.ops.batch_invariant_ops.npu_mm_batch_invariant, "NPU"
         )

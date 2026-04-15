@@ -4,7 +4,6 @@ import weakref
 from typing import Optional
 
 import torch
-from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator import (
@@ -91,6 +90,7 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
         return super().get_mla_kv_buffer(layer, loc, dst_dtype)
 
     def transfer_values_on_device(self, dst_indices, src_indices):
+        from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
         transfer_kv_all_layer_mla(
             src_layers=self.data_ptrs,
             dst_layers=self.data_ptrs,
