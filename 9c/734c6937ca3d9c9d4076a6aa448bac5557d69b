@@ -1,0 +1,14 @@
+python/sglang/srt/hardware_backend/npu/attention/ascend_torch_native_backend.py
+  h_e7288db8f26037 213
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "9c734c6937ca3d9c9d4076a6aa448bac5557d69b",
+  "prompts": {},
+  "humans": {
+    "h_e7288db8f26037": {
+      "author": "chx96642264 <chx96642264@163.com>"
+    }
+  }
+}
