@@ -1,0 +1,43 @@
+python/sglang/srt/mem_cache/pool_host/mla.py
+  s_77ba35a473f82a::t_962e3ae63cb6bf 439-446
+python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
+  s_77ba35a473f82a::t_67803da4fbbfe2 401
+  h_e7288db8f26037 391-400
+  s_77ba35a473f82a::t_3a2034dfb14799 20
+python/sglang/srt/layers/quantization/expert_pack.py
+  s_77ba35a473f82a::t_fb982c1973205e 11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "1ed8542055f6206e51c1dd7d600dbc884d445108",
+  "prompts": {},
+  "humans": {
+    "h_e7288db8f26037": {
+      "author": "chx96642264 <chx96642264@163.com>"
+    }
+  },
+  "sessions": {
+    "s_77ba35a473f82a": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a8fa5942cd869d1c97d7797",
+        "model": "DeepSeek-V4-Flash-Official"
+      },
+      "human_author": null,
+      "custom_attributes": {
+        "external_session_id": "6a8fa5942cd869d1c97d7797",
+        "session_id": "6a8fa5942cd869d1c97d7797",
+        "tool_use_id": "6a9027d12cd869d1c97d79f5",
+        "runtime_client": "trae-tob-git-ai",
+        "source_scene": "agent",
+        "operation_id": "6a9027d12cd869d1c97d79f5",
+        "dedupe_key": "6a8fa5942cd869d1c97d7797:6a9027d12cd869d1c97d79f5:afterEdit:65afdf53",
+        "tool_type": "builtin",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "edit_kind": "file_edit",
+        "client_type": "ide"
+      }
+    }
+  }
+}
