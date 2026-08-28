@@ -1,0 +1,59 @@
+python/sglang/srt/mem_cache/pool_host/mla.py
+  s_b01280030ca97c::t_5f2858331a80e0 439
+  s_0679e06c4c691b::t_0cb4bfb7a2e92e 442
+  s_c39eca61b30c20::t_d3026c36e2fd50 440-441
+  s_0679e06c4c691b::t_6f478221fbf840 443-445
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "5821c98b1c248f1950aded895d81a805931dc2a2",
+  "prompts": {},
+  "sessions": {
+    "s_0679e06c4c691b": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-1a51a12a-bced-44a4-8f70-87322927c7c0",
+        "model": "default"
+      },
+      "human_author": "chx96642264 <chx96642264@163.com>",
+      "custom_attributes": {
+        "edit_kind": "file_edit",
+        "tool": "trae-cue",
+        "client_type": "ide",
+        "external_session_id": "icr-1a51a12a-bced-44a4-8f70-87322927c7c0",
+        "source_scene": "cue"
+      }
+    },
+    "s_b01280030ca97c": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-7a562a0c-d9ff-4626-86d2-d9341194dead",
+        "model": "default"
+      },
+      "human_author": "chx96642264 <chx96642264@163.com>",
+      "custom_attributes": {
+        "tool": "trae-cue",
+        "client_type": "ide",
+        "edit_kind": "file_edit",
+        "external_session_id": "icr-7a562a0c-d9ff-4626-86d2-d9341194dead",
+        "source_scene": "cue"
+      }
+    },
+    "s_c39eca61b30c20": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-9c06712f-baf7-4923-a65a-627c86dd1d29",
+        "model": "default"
+      },
+      "human_author": "chx96642264 <chx96642264@163.com>",
+      "custom_attributes": {
+        "source_scene": "cue",
+        "edit_kind": "file_edit",
+        "tool": "trae-cue",
+        "external_session_id": "icr-9c06712f-baf7-4923-a65a-627c86dd1d29",
+        "client_type": "ide"
+      }
+    }
+  }
+}
