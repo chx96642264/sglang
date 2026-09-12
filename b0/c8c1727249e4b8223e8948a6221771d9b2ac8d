@@ -1,0 +1,57 @@
+python/sglang/srt/managers/schedule_batch.py
+  h_e7288db8f26037 20,2843-2846
+python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+  s_850b4ad1e7cbc3::t_eef9d784db2fe9 36-41,44
+  s_aa4a2da7187285::t_c915632abb4c4f 390,392
+  h_e7288db8f26037 391
+  s_aa4a2da7187285::t_192cfae655c968 388-389
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "b0c8c1727249e4b8223e8948a6221771d9b2ac8d",
+  "prompts": {},
+  "humans": {
+    "h_e7288db8f26037": {
+      "author": "chx96642264 <chx96642264@163.com>"
+    }
+  },
+  "sessions": {
+    "s_850b4ad1e7cbc3": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa3b7ead93d8e7e663f4511",
+        "model": "DeepSeek-V4-Flash-Official"
+      },
+      "human_author": "chx96642264 <chx96642264@163.com>",
+      "custom_attributes": {
+        "session_id": "6aa3b7ead93d8e7e663f4511",
+        "source_scene": "agent",
+        "tool_use_id": "6aa4fd426b0657b09bdcccf6",
+        "tool_type": "builtin",
+        "client_type": "ide",
+        "external_session_id": "6aa3b7ead93d8e7e663f4511",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "edit_kind": "file_edit",
+        "runtime_client": "trae-tob-git-ai",
+        "dedupe_key": "6aa3b7ead93d8e7e663f4511:6aa4fd426b0657b09bdcccf6:afterEdit:1563da88",
+        "operation_id": "6aa4fd426b0657b09bdcccf6"
+      }
+    },
+    "s_aa4a2da7187285": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-305ec790-f8bf-4845-b371-9fc9d3d3c851",
+        "model": "default"
+      },
+      "human_author": "chx96642264 <chx96642264@163.com>",
+      "custom_attributes": {
+        "edit_kind": "file_edit",
+        "external_session_id": "icr-305ec790-f8bf-4845-b371-9fc9d3d3c851",
+        "source_scene": "cue",
+        "client_type": "ide",
+        "tool": "trae-cue"
+      }
+    }
+  }
+}
