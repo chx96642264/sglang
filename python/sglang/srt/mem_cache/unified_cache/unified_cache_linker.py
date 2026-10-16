@@ -55,10 +55,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Components the external linker tolerates in the tree. FULL/SWA build their
+# own transfers; C128 (the DSV4 compressed-KV sidecar) builds none — its KV
+# data rides on the FULL transfer, and its page-table sidecar is not
+# persisted. Components outside this set (e.g. MAMBA) are rejected at init.
 _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
         ComponentType.FULL,
         ComponentType.SWA,
+        ComponentType.C128,
     }
 )
 
@@ -220,8 +225,8 @@ class UnifiedCacheLinkerWrapper:
                 component.name for component in sorted(unsupported, key=int)
             )
             raise ValueError(
-                "External cache linker supports only Full and SWA tree "
-                f"components; unsupported: {names}"
+                "External cache linker cannot persist these tree components "
+                f"(no external transfer support): {names}"
             )
 
         self.cache = cache
@@ -233,7 +238,12 @@ class UnifiedCacheLinkerWrapper:
         self._components = tuple(
             component
             for component in cache._components_tuple
-            if not (self._skip_swa and component is swa)
+            if component.component_type in _EXTERNAL_LINKER_SUPPORTED_COMPONENTS
+            and not (self._skip_swa and component is swa)
+        )
+        logger.info(
+            "External cache linker tree components: %s",
+            ", ".join(c.component_type.name for c in self._components),
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
@@ -276,8 +286,13 @@ class UnifiedCacheLinkerWrapper:
                 LinkerTransferPhase.LOOKUP, None, tail_hashes
             )
             if transfer is None:
-                return result
+                # Component does not participate in external transfers (e.g.
+                # the DSV4 C128 sidecar: its KV data rides on the FULL
+                # transfer and its page-table sidecar is not persisted).
+                continue
             lookup_transfers.append(transfer)
+        if not lookup_transfers:
+            return result
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
@@ -379,14 +394,12 @@ class UnifiedCacheLinkerWrapper:
                 LinkerTransferPhase.LOAD, None, tail_hashes
             )
             if transfer is None:
-                self._update_load(
-                    ExternalLinkerLoadPhase.ABORT,
-                    req,
-                    component_transfers,
-                    prefix_len,
-                )
-                return 0, req.last_node
+                # See `match`: components without external transfers (e.g. the
+                # DSV4 C128 sidecar) are skipped instead of aborting the load.
+                continue
             component_transfers.append((component, transfer))
+        if not component_transfers:
+            return 0, req.last_node
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV

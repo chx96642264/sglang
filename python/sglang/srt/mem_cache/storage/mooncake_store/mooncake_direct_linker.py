@@ -201,9 +201,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             ranges.sort(key=lambda r: (r[3], r[4]))
             clusters = []
             for name, ptr, nbytes, start, end in ranges:
-                if clusters and start < clusters[-1][2]:
-                    clusters[-1][2] = max(clusters[-1][2], end)
-                    clusters[-1][3].append((name, ptr, nbytes))
+                if clusters and start < clusters[-1][1]:
+                    clusters[-1][1] = max(clusters[-1][1], end)
+                    clusters[-1][2].append((name, ptr, nbytes))
                 else:
                     clusters.append([start, end, [(name, ptr, nbytes)]])
             for start, end, members in clusters:
