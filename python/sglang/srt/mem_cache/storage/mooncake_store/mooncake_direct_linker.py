@@ -174,45 +174,39 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def register_buffers(self) -> None:
         seen = set()
         failures = []
-        # NPU's rtsIpcMemGetExportKey only accepts 2MiB-aligned device
-        # addresses; round the registration base down (and extend the end)
-        # so the whole buffer stays covered. Transfers use absolute
-        # addresses inside the buffer, so the aligned margin is never
-        # touched. CUDA needs no adjustment (VMM/mem-pool IPC works on any
-        # sub-range). The per-buffer probe log + collected failures are
-        # temporary diagnostics while validating the fix.
+        # NPU's rtsIpcMemGetExportKey only exports IPC keys for device
+        # addresses that sit at an aclrtMalloc segment head (2MiB-aligned AND
+        # not mid-segment; aligned mid-segment positions are rejected).
+        # torch's caching allocator can place a buffer anywhere inside a
+        # segment, so walk 2MiB-aligned bases downward from the buffer until
+        # the driver accepts one; the segment head bounds the walk. The
+        # registered range [base, align_up(ptr+nbytes)) still covers the whole
+        # buffer, and transfers use absolute addresses inside the buffer, so
+        # the aligned margin is never touched. CUDA needs no adjustment.
+        # The per-buffer probe logs + collected failures are temporary
+        # diagnostics while validating the fix.
         for name, pool in self.pools.items():
             for buffer in pool.get_hybrid_pool_buffer():
                 storage = buffer.untyped_storage()
                 ptr, nbytes = int(storage.data_ptr()), int(storage.nbytes())
-                if is_npu():
-                    align = 2 * 1024 * 1024
-                    end = ptr + nbytes
-                    base = ptr & ~(align - 1)
-                    nbytes = ((end + align - 1) // align) * align - base
-                    ptr = base
                 allocation = (ptr, nbytes)
                 if allocation in seen:
                     continue
                 seen.add(allocation)
-                aligned_2mb = ptr % (2 * 1024 * 1024) == 0
                 logger.info(
-                    "mooncake register probe: pool=%s addr=0x%x size=%d "
-                    "aligned_2mb=%s",
+                    "mooncake register probe: pool=%s addr=0x%x size=%d",
                     name,
                     ptr,
                     nbytes,
-                    aligned_2mb,
                 )
-                result = self.storage.store.register_buffer(ptr, nbytes)
+                result = self._register_buffer(ptr, nbytes)
                 if result not in (0, None):
                     logger.error(
                         "mooncake register FAILED: pool=%s addr=0x%x size=%d "
-                        "aligned_2mb=%s result=%s",
+                        "result=%s",
                         name,
                         ptr,
                         nbytes,
-                        aligned_2mb,
                         result,
                     )
                     failures.append((name, ptr, nbytes, result))
@@ -221,6 +215,31 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "Failed to register GPU KV buffer with Mooncake, "
                 f"error code: {failures[0][-1]}."
             )
+
+    def _register_buffer(self, ptr: int, nbytes: int):
+        if not is_npu():
+            return self.storage.store.register_buffer(ptr, nbytes)
+        align = 2 * 1024 * 1024
+        end = ptr + nbytes
+        end_up = ((end + align - 1) // align) * align
+        base = ptr & ~(align - 1)
+        # Walk 2MiB-aligned bases downward toward the aclrtMalloc segment
+        # head; the head is always exportable, so this terminates. 64 steps
+        # = 128 MiB of downward margin, far beyond any realistic offset.
+        last_result = None
+        for step in range(64):
+            candidate = base - step * align
+            result = self.storage.store.register_buffer(candidate, end_up - candidate)
+            last_result = result
+            if result in (0, None):
+                logger.info(
+                    "mooncake register accepted: base=0x%x size=%d steps=%d",
+                    candidate,
+                    end_up - candidate,
+                    step,
+                )
+                return result
+        return last_result
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
