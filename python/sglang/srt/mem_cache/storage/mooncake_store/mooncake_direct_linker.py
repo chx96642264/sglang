@@ -173,18 +173,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def register_buffers(self) -> None:
         seen = set()
-        failures = []
-        # NPU's rtsIpcMemGetExportKey only exports IPC keys for device
-        # addresses that sit at an aclrtMalloc segment head (2MiB-aligned AND
-        # not mid-segment; aligned mid-segment positions are rejected).
-        # torch's caching allocator can place a buffer anywhere inside a
-        # segment, so walk 2MiB-aligned bases downward from the buffer until
-        # the driver accepts one; the segment head bounds the walk. The
-        # registered range [base, align_up(ptr+nbytes)) still covers the whole
-        # buffer, and transfers use absolute addresses inside the buffer, so
-        # the aligned margin is never touched. CUDA needs no adjustment.
-        # The per-buffer probe logs + collected failures are temporary
-        # diagnostics while validating the fix.
+        buffers = []
         for name, pool in self.pools.items():
             for buffer in pool.get_hybrid_pool_buffer():
                 storage = buffer.untyped_storage()
@@ -193,53 +182,59 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if allocation in seen:
                     continue
                 seen.add(allocation)
+                buffers.append((name, ptr, nbytes))
+        failures = []
+        if is_npu():
+            # NPU: the driver exports an IPC key for any 2MiB-aligned device
+            # address inside an aclrtMalloc allocation, but Mooncake rejects
+            # overlapping local segments. Adjacent KV buffers frequently
+            # share a 2MiB window, so per-buffer aligned ranges would
+            # overlap; merge overlapping ranges into one registration per
+            # cluster (buffers are VA-contiguous, so each cluster stays
+            # inside a single allocation).
+            align = 2 * 1024 * 1024
+            ranges = []
+            for name, ptr, nbytes in buffers:
+                start = ptr & ~(align - 1)
+                end = ((ptr + nbytes + align - 1) // align) * align
+                ranges.append((name, ptr, nbytes, start, end))
+            ranges.sort(key=lambda r: (r[3], r[4]))
+            clusters = []
+            for name, ptr, nbytes, start, end in ranges:
+                if clusters and start < clusters[-1][2]:
+                    clusters[-1][2] = max(clusters[-1][2], end)
+                    clusters[-1][3].append((name, ptr, nbytes))
+                else:
+                    clusters.append([start, end, [(name, ptr, nbytes)]])
+            for start, end, members in clusters:
                 logger.info(
-                    "mooncake register probe: pool=%s addr=0x%x size=%d",
-                    name,
-                    ptr,
-                    nbytes,
+                    "mooncake register probe: cluster base=0x%x size=%d "
+                    "buffers=%d",
+                    start,
+                    end - start,
+                    len(members),
                 )
-                result = self._register_buffer(ptr, nbytes)
+                result = self.storage.store.register_buffer(start, end - start)
                 if result not in (0, None):
                     logger.error(
-                        "mooncake register FAILED: pool=%s addr=0x%x size=%d "
-                        "result=%s",
-                        name,
-                        ptr,
-                        nbytes,
+                        "mooncake register FAILED: cluster base=0x%x size=%d "
+                        "buffers=%d result=%s",
+                        start,
+                        end - start,
+                        len(members),
                         result,
                     )
+                    failures.extend((m[0], m[1], m[2], result) for m in members)
+        else:
+            for name, ptr, nbytes in buffers:
+                result = self.storage.store.register_buffer(ptr, nbytes)
+                if result not in (0, None):
                     failures.append((name, ptr, nbytes, result))
         if failures:
             raise RuntimeError(
                 "Failed to register GPU KV buffer with Mooncake, "
                 f"error code: {failures[0][-1]}."
             )
-
-    def _register_buffer(self, ptr: int, nbytes: int):
-        if not is_npu():
-            return self.storage.store.register_buffer(ptr, nbytes)
-        align = 2 * 1024 * 1024
-        end = ptr + nbytes
-        end_up = ((end + align - 1) // align) * align
-        base = ptr & ~(align - 1)
-        # Walk 2MiB-aligned bases downward toward the aclrtMalloc segment
-        # head; the head is always exportable, so this terminates. 64 steps
-        # = 128 MiB of downward margin, far beyond any realistic offset.
-        last_result = None
-        for step in range(64):
-            candidate = base - step * align
-            result = self.storage.store.register_buffer(candidate, end_up - candidate)
-            last_result = result
-            if result in (0, None):
-                logger.info(
-                    "mooncake register accepted: base=0x%x size=%d steps=%d",
-                    candidate,
-                    end_up - candidate,
-                    step,
-                )
-                return result
-        return last_result
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
