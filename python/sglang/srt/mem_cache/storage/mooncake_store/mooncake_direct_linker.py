@@ -173,19 +173,44 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def register_buffers(self) -> None:
         seen = set()
-        for pool in self.pools.values():
+        failures = []
+        # Diagnostic probe: log every allocation (pool, addr, size, 2MiB
+        # alignment) and collect ALL failures instead of aborting on the
+        # first, so one run reveals the full registration pattern.
+        for name, pool in self.pools.items():
             for buffer in pool.get_hybrid_pool_buffer():
                 storage = buffer.untyped_storage()
                 allocation = (int(storage.data_ptr()), int(storage.nbytes()))
                 if allocation in seen:
                     continue
                 seen.add(allocation)
-                result = self.storage.store.register_buffer(*allocation)
+                ptr, nbytes = allocation
+                aligned_2mb = ptr % (2 * 1024 * 1024) == 0
+                logger.info(
+                    "mooncake register probe: pool=%s addr=0x%x size=%d "
+                    "aligned_2mb=%s",
+                    name,
+                    ptr,
+                    nbytes,
+                    aligned_2mb,
+                )
+                result = self.storage.store.register_buffer(ptr, nbytes)
                 if result not in (0, None):
-                    raise RuntimeError(
-                        "Failed to register GPU KV buffer with Mooncake, "
-                        f"error code: {result}."
+                    logger.error(
+                        "mooncake register FAILED: pool=%s addr=0x%x size=%d "
+                        "aligned_2mb=%s result=%s",
+                        name,
+                        ptr,
+                        nbytes,
+                        aligned_2mb,
+                        result,
                     )
+                    failures.append((name, ptr, nbytes, result))
+        if failures:
+            raise RuntimeError(
+                "Failed to register GPU KV buffer with Mooncake, "
+                f"error code: {failures[0][-1]}."
+            )
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
