@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPoolFP4,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -40,18 +40,18 @@ def mla_dedup_rank_and_size() -> tuple[int, int]:
 
 
 def mla_host_dedup_eligible(kv_cache, storage_backend: Optional[str]) -> bool:
-    """Rank-independent gate. CUDA only; FP4 excluded (its per-rank scale
+    """Rank-independent gate. CUDA/NPU only; FP4 excluded (its per-rank scale
     buffer is not covered by the broadcast)."""
     return (
         isinstance(kv_cache, MLATokenToKVPool)
         and not isinstance(kv_cache, MLATokenToKVPoolFP4)
-        and is_cuda()
+        and (is_cuda() or is_npu())
         and storage_supports_host_dedup(storage_backend)
     )
 
 
 class MLAHostDedupBroadcaster:
-    """Layerwise MLA/DSA broadcast over a dedicated NCCL group."""
+    """Layerwise MLA/DSA broadcast over a dedicated device collective group."""
 
     def __init__(
         self,
@@ -101,7 +101,7 @@ class MLAHostDedupBroadcaster:
         tp_group: torch.distributed.ProcessGroup,
         attn_tp_group: Optional[torch.distributed.ProcessGroup],
     ) -> MLAHostDedupBroadcaster:
-        """Build and initialize the NCCL group before host-pool allocation."""
+        """Build and initialize the device collective group before host-pool allocation."""
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
         base_group = tp_group
@@ -109,20 +109,24 @@ class MLAHostDedupBroadcaster:
             base_group = attn_tp_group
         group_ranks = torch.distributed.get_process_group_ranks(base_group)
         group = create_custom_parallel_group(
-            group_ranks=list(group_ranks), backend="nccl"
+            group_ranks=list(group_ranks),
+            backend="hccl" if is_npu() else "nccl",
         )
         broadcaster = cls(device_pool, group, src_global_rank=group_ranks[0])
         broadcaster._warmup_group()
         return broadcaster
 
     def _warmup_group(self) -> None:
-        """Initialize the NCCL communicator before serving."""
+        """Initialize the device collective communicator before serving."""
         warmup = self.kv_staging[:1]
         if self.is_src:
             warmup.zero_()
         torch.distributed.broadcast(warmup, src=self.src_global_rank, group=self.group)
-        torch.cuda.synchronize(self.device)
-        logger.info("MLA host-dedup NCCL broadcast group warmup completed")
+        if is_npu():
+            torch.npu.synchronize(self.device)
+        else:
+            torch.cuda.synchronize(self.device)
+        logger.info("MLA host-dedup device broadcast group warmup completed")
 
     def prepare_broadcast(
         self, device_indices: torch.Tensor, load_stream

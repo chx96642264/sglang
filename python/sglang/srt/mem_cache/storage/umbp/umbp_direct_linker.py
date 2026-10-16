@@ -30,7 +30,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
 )
-from sglang.srt.utils import freeze_gc, get_device_module
+from sglang.srt.utils import freeze_gc, get_device_module, is_npu
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
@@ -55,7 +55,13 @@ def _storage_suffix(
     if not rank_replicated:
         parts.append(f"tp{tp_rank}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
-    return "_".join(parts)
+    suffix = "_".join(parts)
+    # NPU pools live in their own keyspace so a GPU and an NPU cluster sharing
+    # the same object store cannot read each other's pages. CUDA keys are
+    # unchanged for compatibility with existing persisted objects.
+    if is_npu():
+        return f"npu_{suffix}"
+    return suffix
 
 
 def _ordered_layers(entry) -> list[int]:

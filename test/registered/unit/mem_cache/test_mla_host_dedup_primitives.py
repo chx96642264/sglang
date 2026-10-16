@@ -262,6 +262,57 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
         synchronize.assert_called_once_with(device_pool.device)
         self.assertIs(broadcaster.group, dedicated_group)
 
+    def test_build_uses_hccl_backend_and_npu_sync_on_npu(self):
+        # NPU peers must create the dedicated collective group over HCCL and
+        # synchronize through torch.npu instead of torch.cuda. The broadcast
+        # primitive itself is device-agnostic; only backend selection and the
+        # warmup sync differ. Runs on CPU CI with all device calls mocked.
+        tp_group = object()
+        dedicated_group = object()
+        device_pool = _device_pool_stub(
+            layer_num=2,
+            device=torch.device("cpu"),
+            kv_cache_dim=4,
+            kv_buffer=[torch.empty(3, 1, 4)],
+        )
+
+        with (
+            mock.patch(
+                "sglang.srt.mem_cache.mla_host_dedup.is_npu", return_value=True
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.mla_host_dedup.is_dp_attention_enabled",
+                return_value=False,
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.mla_host_dedup.mla_dedup_rank_and_size",
+                return_value=(0, 2),
+            ),
+            mock.patch.object(
+                torch.distributed,
+                "get_process_group_ranks",
+                return_value=[4, 5],
+            ),
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.create_custom_parallel_group",
+                return_value=dedicated_group,
+            ) as create_group,
+            mock.patch.object(torch.distributed, "broadcast") as broadcast,
+            # create=True keeps the test hermetic on CPU wheels without torch_npu.
+            mock.patch("torch.npu.synchronize", create=True) as synchronize,
+        ):
+            broadcaster = MLAHostDedupBroadcaster.build(
+                device_pool, tp_group, attn_tp_group=None
+            )
+
+        create_group.assert_called_once_with(group_ranks=[4, 5], backend="hccl")
+        broadcast.assert_called_once()
+        self.assertEqual(broadcast.call_args.args[0].numel(), 1)
+        self.assertIs(broadcast.call_args.kwargs["group"], dedicated_group)
+        self.assertEqual(broadcast.call_args.kwargs["src"], 4)
+        synchronize.assert_called_once_with(device_pool.device)
+        self.assertIs(broadcaster.group, dedicated_group)
+
     def test_indexer_pages_preserve_logical_order(self):
         broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
         broadcaster.device = torch.device("cpu")

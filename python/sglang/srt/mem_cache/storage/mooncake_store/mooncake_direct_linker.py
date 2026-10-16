@@ -31,7 +31,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
 )
-from sglang.srt.utils import freeze_gc, get_device_module
+from sglang.srt.utils import freeze_gc, get_device_module, is_npu
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
@@ -44,7 +44,14 @@ def _storage_suffix(
     if not rank_replicated:
         parts.append(f"tp{tp_rank}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
-    return "_".join(parts)
+    suffix = "_".join(parts)
+    # Keep NPU pools in their own storage keyspace: a GPU and an NPU cluster
+    # sharing one Mooncake instance would otherwise read each other's KV pages
+    # (same model + same layout hashes to identical keys). GPU keys are
+    # unchanged, so this does not break existing persisted caches on CUDA.
+    if is_npu():
+        return f"npu_{suffix}"
+    return suffix
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
