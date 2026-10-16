@@ -174,17 +174,27 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def register_buffers(self) -> None:
         seen = set()
         failures = []
-        # Diagnostic probe: log every allocation (pool, addr, size, 2MiB
-        # alignment) and collect ALL failures instead of aborting on the
-        # first, so one run reveals the full registration pattern.
+        # NPU's rtsIpcMemGetExportKey only accepts 2MiB-aligned device
+        # addresses; round the registration base down (and extend the end)
+        # so the whole buffer stays covered. Transfers use absolute
+        # addresses inside the buffer, so the aligned margin is never
+        # touched. CUDA needs no adjustment (VMM/mem-pool IPC works on any
+        # sub-range). The per-buffer probe log + collected failures are
+        # temporary diagnostics while validating the fix.
         for name, pool in self.pools.items():
             for buffer in pool.get_hybrid_pool_buffer():
                 storage = buffer.untyped_storage()
-                allocation = (int(storage.data_ptr()), int(storage.nbytes()))
+                ptr, nbytes = int(storage.data_ptr()), int(storage.nbytes())
+                if is_npu():
+                    align = 2 * 1024 * 1024
+                    end = ptr + nbytes
+                    base = ptr & ~(align - 1)
+                    nbytes = ((end + align - 1) // align) * align - base
+                    ptr = base
+                allocation = (ptr, nbytes)
                 if allocation in seen:
                     continue
                 seen.add(allocation)
-                ptr, nbytes = allocation
                 aligned_2mb = ptr % (2 * 1024 * 1024) == 0
                 logger.info(
                     "mooncake register probe: pool=%s addr=0x%x size=%d "
