@@ -259,6 +259,8 @@ def _build_deepseek_v4_device_pool_group(
     kvcache: Any,
     page_size: int,
     mtp_draft_device_pools: tuple[Any, ...] = (),
+    *,
+    skip_c128: bool = False,
 ) -> DevicePoolGroup:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import HiSparseC4DevicePool
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -322,7 +324,6 @@ def _build_deepseek_v4_device_pool_group(
             )
 
     c4_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 4)
-    c128_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 128)
 
     add(
         PoolName.DEEPSEEK_V4_C4,
@@ -339,13 +340,20 @@ def _build_deepseek_v4_device_pool_group(
             region.device_buffers,
             mappings.c4,
         )
-    add(
-        PoolName.DEEPSEEK_V4_C128,
-        PoolName.KV,
-        kvcache.c128_kv_pool,
-        c128_buffers,
-        mappings.c128,
-    )
+    # The C128 entry maps FULL page ids to pool rows 1:1, which only holds for
+    # the GPU KV-derived sidecar layout. NPU runs C128 as an independently
+    # allocated pool of kernel pages (c128_attn_allocator + req_to_c128_sidecar),
+    # so its rows are neither FULL-page-addressed nor one page per row; skip it
+    # there until the C128 component implements its own linker transfers.
+    if not skip_c128:
+        c128_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 128)
+        add(
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.KV,
+            kvcache.c128_kv_pool,
+            c128_buffers,
+            mappings.c128,
+        )
 
     # fp8 two-pool unified_kv: one row index addresses both kv_buffer (fp8 nope) and
     # kv_buffer_rope (bf16 rope), but unified_region_buffers() above returns the nope
@@ -356,6 +364,8 @@ def _build_deepseek_v4_device_pool_group(
         (4, PoolName.DEEPSEEK_V4_C4_ROPE, kvcache.c4_kv_pool, mappings.c4),
         (128, PoolName.DEEPSEEK_V4_C128_ROPE, kvcache.c128_kv_pool, mappings.c128),
     ):
+        if skip_c128 and ratio == 128:
+            continue
         rope_region = (
             kvcache.unified_rope_region_buffers(ratio) if is_unified_kv else None
         )

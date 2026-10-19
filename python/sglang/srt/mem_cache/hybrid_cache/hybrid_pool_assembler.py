@@ -1843,8 +1843,16 @@ class _DeepSeekV4Strategy(StackStrategy):
             _build_deepseek_v4_device_pool_group,
         )
 
+        # NPU runs C128 as an independently allocated pool (kernel pages from
+        # c128_attn_allocator, addressed through req_to_c128_sidecar), so the
+        # KV-derived C128 entry cannot map it; skip it there, mirroring the C128
+        # sidecar exclusion in build() below.
+        skip_c128 = hasattr(params.req_to_token_pool, "req_to_c128_sidecar")
         return _build_deepseek_v4_device_pool_group(
-            kvcache, page_size, params.mtp_draft_device_pools
+            kvcache,
+            page_size,
+            params.mtp_draft_device_pools,
+            skip_c128=skip_c128,
         )
 
     def build(
