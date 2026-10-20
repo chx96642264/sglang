@@ -394,13 +394,26 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 started.append(keys)
 
             for layer in range(self.num_layers):
-                for name, (keys, locations) in batches.items():
+                # One merged RPC per layer across every pool that maps to it:
+                # a per-pool call would serialize pool_count round trips per
+                # layer, and a hybrid layout (SWA/C4/C128/indexer/state pools)
+                # would stretch large-prefix loads far enough to outlive the
+                # store's read-lease TTL mid-session.
+                keys, ptrs, sizes, offsets = [], [], [], []
+                spans = []
+                for name, (pool_keys, locations) in batches.items():
                     meta = self.pools[name].get_prepared_layer_range_meta(
                         locations, layer
                     )
                     if meta is None:
                         continue
-                    ptrs, sizes, offsets = meta
+                    pool_ptrs, pool_sizes, pool_offsets = meta
+                    spans.append((name, len(keys), len(keys) + len(pool_keys)))
+                    keys.extend(pool_keys)
+                    ptrs.extend(pool_ptrs)
+                    sizes.extend(pool_sizes)
+                    offsets.extend(pool_offsets)
+                if keys:
                     result = self.storage.store.batch_get_into_multi_buffer_ranges(
                         keys,
                         ptrs,
@@ -413,8 +426,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         or isinstance(result, int)
                         or list(result) != expected
                     ):
+                        failed = [
+                            name
+                            for name, start, end in spans
+                            if any(
+                                result is None
+                                or isinstance(result, int)
+                                or result[i] != expected[i]
+                                for i in range(start, end)
+                            )
+                        ]
                         raise RuntimeError(
-                            f"Mooncake range get failed for pool={name}, "
+                            f"Mooncake range get failed for pools={failed}, "
                             f"layer={layer}: transferred={result}, "
                             f"expected={expected}"
                         )
