@@ -472,6 +472,7 @@ class FullComponent(TreeComponent):
         phase: LinkerTransferPhase,
         node: Optional[UnifiedTreeNode],
         keys: Optional[Sequence[str]],
+        device_hit_pages: int = 0,
     ) -> Optional[PoolTransfer]:
         if phase == LinkerTransferPhase.OFFLOAD:
             if node is None or not node.hash_value:

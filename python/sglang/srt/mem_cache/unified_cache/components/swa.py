@@ -1221,6 +1221,7 @@ class SWAComponent(TreeComponent):
         phase: LinkerTransferPhase,
         node: Optional[UnifiedTreeNode],
         keys: Optional[Sequence[str]],
+        device_hit_pages: int = 0,
     ) -> Optional[PoolTransfer]:
         page = self.cache.page_size
         window_pages = (self.sliding_window_size + page - 1) // page
