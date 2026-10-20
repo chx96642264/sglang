@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     PoolTransferResult,
@@ -30,6 +31,8 @@ from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    ExternalLinkerLoadPhase,
+    LinkerTransferPhase,
     PrepareLoadBackResult,
     TreeComponent,
 )
@@ -508,3 +511,153 @@ class C128SidecarComponent(TreeComponent):
                 self.tree_core.set_component_device_value(nid, ct, page_ids.clone())
                 offset += n_len
             return
+
+    # ---- External Cache Linker Hooks ----
+
+    def _linker_group_geometry(self) -> Optional[tuple[int, int]]:
+        """(kernel_page_size, FULL pages per C128 group), or None when the
+        FULL page size does not divide the group (linker disabled)."""
+        kernel_page_size = self.allocator.c128_attn_allocator.page_size
+        group_tokens = 128 * kernel_page_size
+        page = self.cache.page_size
+        if group_tokens % page:
+            return None
+        return kernel_page_size, group_tokens // page
+
+    def _tail_group_ends(
+        self, keys: Sequence[str], device_hit_pages: int, group_pages: int
+    ) -> list[int]:
+        """Tail indices (0-based) of the pages that close a C128 group."""
+        return [
+            i
+            for i in range(len(keys))
+            if (device_hit_pages + i + 1) % group_pages == 0
+        ]
+
+    def build_external_linker_transfer(
+        self,
+        phase: LinkerTransferPhase,
+        node: Optional[UnifiedTreeNode],
+        keys: Optional[Sequence[str]],
+        device_hit_pages: int = 0,
+    ) -> Optional[PoolTransfer]:
+        ct = self.component_type
+        geometry = self._linker_group_geometry()
+        if geometry is None:
+            return None
+        kernel_page_size, group_pages = geometry
+
+        if phase == LinkerTransferPhase.OFFLOAD:
+            if node is None or not node.hash_value:
+                return None
+            page_ids = node.component_data[ct].value
+            if page_ids is None or page_ids.numel() == 0:
+                return None
+            hashes = list(node.hash_value)
+            end_pages = self._node_depth(node) // self.cache.page_size
+            node_start = end_pages - len(hashes)
+            num = page_ids.numel()
+            # Pages only attach to group-boundary nodes, and the node's P pages
+            # are the last P groups closing at its end boundary. Each page's
+            # storage key is the chained hash of the FULL page ending its group
+            # (hash_value is position-anchored, so it matches the tail hashes
+            # produced at LOOKUP / LOAD time).
+            if end_pages % group_pages or node_start > end_pages - (
+                num - 1
+            ) * group_pages - 1:
+                return None
+            group_end_keys = [
+                hashes[end_pages - (num - 1 - i) * group_pages - 1 - node_start]
+                for i in range(num)
+            ]
+            return PoolTransfer(
+                name=PoolName.DEEPSEEK_V4_C128,
+                indices_from_pool=None,
+                device_indices=self._expand_page_indices(
+                    page_ids.to(torch.int64), kernel_page_size
+                ),
+                keys=group_end_keys,
+            )
+
+        if not keys:
+            return None
+
+        ends = self._tail_group_ends(keys, device_hit_pages, group_pages)
+        group_keys = [keys[i] for i in ends]
+
+        if phase == LinkerTransferPhase.LOOKUP:
+            # A prefix length is C128-restorable whenever every group it fully
+            # contains exists, so the BLOCK_GROUPS policy in batch_exists_v2
+            # derives the restorable set from these group-end keys. A tail that
+            # closes no group leaves C128 unconstrained (empty keys resolve to
+            # no transfer at all).
+            return PoolTransfer(
+                name=PoolName.DEEPSEEK_V4_C128,
+                indices_from_pool=None,
+                keys=group_keys,
+                hit_policy=PoolHitPolicy.BLOCK_GROUPS,
+                key_pages=ends,
+            )
+
+        if phase == LinkerTransferPhase.LOAD:
+            if not ends:
+                # The restorable prefix closes no C128 group: keep the transfer
+                # (returning None would abort the whole load) but carry no work;
+                # resolve_transfers drops key-less transfers.
+                return PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    indices_from_pool=None,
+                    device_indices=torch.empty((0,), dtype=torch.int64),
+                    keys=[],
+                    hit_policy=PoolHitPolicy.BLOCK_GROUPS,
+                    key_pages=[],
+                )
+            num_groups = len(ends)
+            if not self.allocator.ensure_c128_capacity(self.cache, num_groups):
+                return None
+            slots = self.allocator.c128_attn_allocator.alloc(
+                num_groups * kernel_page_size
+            )
+            if slots is None:
+                return None
+            return PoolTransfer(
+                name=PoolName.DEEPSEEK_V4_C128,
+                indices_from_pool=None,
+                device_indices=slots.to(torch.int64),
+                keys=group_keys,
+                hit_policy=PoolHitPolicy.BLOCK_GROUPS,
+                key_pages=ends,
+            )
+
+        return None
+
+    def update_external_linker_load(
+        self,
+        phase: ExternalLinkerLoadPhase,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+    ) -> Optional[PoolTransfer]:
+        if phase == ExternalLinkerLoadPhase.ABORT:
+            # LOAD allocated raw slots with no refcount, so plain-free them.
+            indices = transfer.device_indices
+            if indices is not None and indices.numel():
+                self.allocator.c128_attn_allocator.free(indices)
+            return None
+
+        if phase == ExternalLinkerLoadPhase.PREPARE:
+            indices = transfer.device_indices
+            if indices is None or not indices.numel():
+                return transfer
+            kernel_page_size = self.allocator.c128_attn_allocator.page_size
+            page_ids = torch.unique(indices // kernel_page_size)
+            # The loaded groups extend the device-hit groups the match
+            # finalizer already installed, so publish both under the request.
+            # set_c128_prefix_pages takes the refcount (deferred to alloc when
+            # the request slot does not exist yet), mirroring the match path.
+            device_pages = self._collect_device_pages(req.best_match_node)
+            self.cache.req_to_token_pool.set_c128_prefix_pages(
+                req, torch.cat([device_pages, page_ids.to(device_pages.dtype)])
+            )
+        return transfer

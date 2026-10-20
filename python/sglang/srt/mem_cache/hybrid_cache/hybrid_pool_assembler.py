@@ -1845,14 +1845,15 @@ class _DeepSeekV4Strategy(StackStrategy):
 
         # NPU runs C128 as an independently allocated pool (kernel pages from
         # c128_attn_allocator, addressed through req_to_c128_sidecar), so the
-        # KV-derived C128 entry cannot map it; skip it there, mirroring the C128
-        # sidecar exclusion in build() below.
-        skip_c128 = hasattr(params.req_to_token_pool, "req_to_c128_sidecar")
+        # C128 entry is registered as an independent pool whose linker
+        # transfers the C128 sidecar component builds itself, mirroring the
+        # C128 sidecar handling in build() below.
+        independent_c128 = hasattr(params.req_to_token_pool, "req_to_c128_sidecar")
         return _build_deepseek_v4_device_pool_group(
             kvcache,
             page_size,
             params.mtp_draft_device_pools,
-            skip_c128=skip_c128,
+            independent_c128=independent_c128,
         )
 
     def build(
@@ -2353,6 +2354,32 @@ class _DsaStrategy(StackStrategy):
         )
 
 
+class _NpuMlaStrategy(_PlainKvStrategy):
+    """NPU MLA pool (``NPUMLATokenToKVPool``, e.g. GLM-5.2 on Ascend).
+
+    The HiCache host stack is the plain MLA one (inherited ``build``); only the
+    direct external linker needs pool-group geometry, because the NPU MLA pool
+    keeps separate k/v/index buffers instead of the GPU DSA pool's packed
+    ``kv_buffer`` / ``index_k_with_scale_buffer`` lists.
+    """
+
+    def matches(self, kvcache, components):
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+
+        return isinstance(kvcache, NPUMLATokenToKVPool) and components == {
+            ComponentType.FULL
+        }
+
+    def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _build_npu_mla_device_pool_group,
+        )
+
+        return _build_npu_mla_device_pool_group(
+            kvcache, page_size, params.mtp_draft_device_pools
+        )
+
+
 # Resolved first-to-last; _PlainKvStrategy is the catch-all fallback.
 _STRATEGIES: list[StackStrategy] = [
     _DeepSeekV4Strategy(),
@@ -2361,6 +2388,7 @@ _STRATEGIES: list[StackStrategy] = [
     _MambaSwaStrategy(),
     _DsaStrategy(),
     _MiniMaxSparseStrategy(),
+    _NpuMlaStrategy(),
     _PlainKvStrategy(),
 ]
 

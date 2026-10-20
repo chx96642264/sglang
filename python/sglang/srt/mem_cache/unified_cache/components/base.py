@@ -861,6 +861,7 @@ class TreeComponent(ABC):
         phase: LinkerTransferPhase,
         node: Optional[UnifiedTreeNode],
         keys: Optional[Sequence[str]],
+        device_hit_pages: int = 0,
     ) -> Optional[PoolTransfer]:
         """Build this component's direct device/storage transfer.
 
@@ -868,6 +869,10 @@ class TreeComponent(ABC):
         otherwise. ``keys`` are the per-page hashes of the device-uncached tail
         (page 0 is the first uncached page) on LOOKUP / LOAD, and None on
         OFFLOAD, where the keys come from ``node.hash_value``.
+        ``device_hit_pages`` is the device-cached prefix length in pages on
+        LOOKUP / LOAD (0 on OFFLOAD); components whose objects are anchored to
+        absolute page positions (e.g. C128 compression groups) need it to
+        locate their boundaries inside the tail.
         """
         return None
 

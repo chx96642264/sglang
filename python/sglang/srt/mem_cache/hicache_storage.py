@@ -124,6 +124,10 @@ class PoolTransfer:
     # BLOCK_GROUPS geometry: FULL pages per block and keys (pages) per group.
     block_pages: int = 0
     group_pages: int = 0
+    # BLOCK_GROUPS: tail-relative (0-based) FULL page indices closing each
+    # group, parallel to ``keys``. batch_exists_v2 maps each group's existence
+    # to the prefix lengths past its end page.
+    key_pages: Optional[List[int]] = None
 
 
 @dataclass(frozen=True)

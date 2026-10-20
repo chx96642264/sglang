@@ -275,7 +275,10 @@ class UnifiedCacheLinkerWrapper:
         lookup_transfers = []
         for component in self._components:
             transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOOKUP, None, tail_hashes
+                LinkerTransferPhase.LOOKUP,
+                None,
+                tail_hashes,
+                device_hit_len // page,
             )
             if transfer is None:
                 return result
@@ -378,7 +381,10 @@ class UnifiedCacheLinkerWrapper:
         component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
         for component in self._components:
             transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOAD, None, tail_hashes
+                LinkerTransferPhase.LOAD,
+                None,
+                tail_hashes,
+                device_hit_len // cache.page_size,
             )
             if transfer is None:
                 self._update_load(

@@ -891,8 +891,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         prepared = []
         all_component_keys = []
         for transfer in pool_transfers or []:
+            if transfer.hit_policy == PoolHitPolicy.BLOCK_GROUPS:
+                # Group-packed pools (e.g. DSV4 C128) store one object per
+                # group keyed by the group's end page; the component already
+                # subsampled transfer.keys at those positions (key_pages).
+                page_keys = list(transfer.keys or [])
+            else:
+                page_keys = keys
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
+                page_keys, transfer
             )
             component_keys = self._tag_keys(component_keys)
             start = len(all_component_keys)
@@ -908,16 +915,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if not restorable:
                 break
             ex = all_exists[start:end]
+            if transfer.hit_policy == PoolHitPolicy.BLOCK_GROUPS:
+                # page_exists[g] is group g's existence: BLOCK_GROUPS component
+                # keys were derived from the group-end keys, not every page.
+                num_pages = len(ex) // key_multiplier if key_multiplier > 0 else 0
+            else:
+                num_pages = kv_pages
             if key_multiplier > 0:
                 page_exists = [
                     all(
                         r == 1
                         for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
                     )
-                    for i in range(kv_pages)
+                    for i in range(num_pages)
                 ]
             else:
-                page_exists = [False] * kv_pages
+                page_exists = [False] * num_pages
             boundary = 0
             pool_restorable = []
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
@@ -938,6 +951,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         pool_restorable.append(prefix_len)
                         if boundary == 0:
                             boundary = prefix_len
+            elif transfer.hit_policy == PoolHitPolicy.BLOCK_GROUPS:
+                group_ends = list(transfer.key_pages or [])
+                # A prefix length is restorable when every group it fully
+                # contains exists; groups only constrain lengths past their
+                # end page (a tail closing no group leaves a cap of kv_pages).
+                missing = next(
+                    (g for g, ok in enumerate(page_exists) if not ok),
+                    len(page_exists),
+                )
+                if missing < len(group_ends):
+                    cap = group_ends[missing]
+                else:
+                    cap = kv_pages
+                pool_restorable = list(range(1, cap + 1))
+                boundary = min(cap, kv_pages)
             else:
                 raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
             if boundary:

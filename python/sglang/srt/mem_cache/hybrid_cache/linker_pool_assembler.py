@@ -192,11 +192,26 @@ class DevicePoolGroup:
             return []
         if not allow_missing_kv and (kv is None or not kv.keys):
             return []
-        if not allow_partial and not set(self.sources.values()) <= set(by_name):
+        # Independent entries (indices_from_pool=None, e.g. the NPU C128 pool)
+        # carry their own indices and impose no source requirement.
+        required_sources = {
+            source for source in self.sources.values() if source is not None
+        }
+        if not allow_partial and not required_sources <= set(by_name):
             return []
 
         resolved = []
         for name, source_name in self.sources.items():
+            if source_name is None:
+                # Independent entry: the component's transfer already addresses
+                # this pool's rows, so its device indices are the host indices.
+                own = by_name.get(name)
+                if own is None or not own.keys:
+                    continue
+                resolved.append(
+                    replace(own, host_indices=own.device_indices, indices_from_pool=None)
+                )
+                continue
             source = by_name.get(source_name)
             if source is None or not source.keys:
                 continue
@@ -260,7 +275,7 @@ def _build_deepseek_v4_device_pool_group(
     page_size: int,
     mtp_draft_device_pools: tuple[Any, ...] = (),
     *,
-    skip_c128: bool = False,
+    independent_c128: bool = False,
 ) -> DevicePoolGroup:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import HiSparseC4DevicePool
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -340,12 +355,27 @@ def _build_deepseek_v4_device_pool_group(
             region.device_buffers,
             mappings.c4,
         )
-    # The C128 entry maps FULL page ids to pool rows 1:1, which only holds for
-    # the GPU KV-derived sidecar layout. NPU runs C128 as an independently
-    # allocated pool of kernel pages (c128_attn_allocator + req_to_c128_sidecar),
-    # so its rows are neither FULL-page-addressed nor one page per row; skip it
-    # there until the C128 component implements its own linker transfers.
-    if not skip_c128:
+    # The KV-derived C128 entry maps FULL page ids to pool rows 1:1, which only
+    # holds for the GPU layout. NPU runs C128 as an independently allocated
+    # pool of kernel pages (c128_attn_allocator + req_to_c128_sidecar); register
+    # it as its own entry addressed by kernel-page rows, whose linker transfers
+    # the C128 tree component builds itself (group-keyed storage objects).
+    if independent_c128:
+        kernel_page_size = getattr(kvcache.c128_kv_pool, "kernel_page_size", None)
+        if kernel_page_size:
+            c128_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 128)
+            entries.append(
+                DevicePoolEntry(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    indices_from_pool=None,
+                    device_pool=kvcache.c128_kv_pool,
+                    components=[list(c128_buffers)],
+                    layer_mapping=mappings.c128,
+                    page_size=kernel_page_size,
+                    rows_are_pages=True,
+                )
+            )
+    else:
         c128_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 128)
         add(
             PoolName.DEEPSEEK_V4_C128,
@@ -364,7 +394,7 @@ def _build_deepseek_v4_device_pool_group(
         (4, PoolName.DEEPSEEK_V4_C4_ROPE, kvcache.c4_kv_pool, mappings.c4),
         (128, PoolName.DEEPSEEK_V4_C128_ROPE, kvcache.c128_kv_pool, mappings.c128),
     ):
-        if skip_c128 and ratio == 128:
+        if independent_c128 and ratio == 128:
             continue
         rope_region = (
             kvcache.unified_rope_region_buffers(ratio) if is_unified_kv else None
@@ -450,6 +480,154 @@ def _build_dsa_device_pool_group(
             rows_are_pages=True,
         ),
     ]
+    return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
+
+
+def _build_npu_mla_device_pool_group(
+    kvcache: Any,
+    page_size: int,
+    mtp_draft_device_pools: tuple[Any, ...] = (),
+) -> DevicePoolGroup:
+    """Direct-linker pool group for ``NPUMLATokenToKVPool`` (e.g. GLM-5.2 NPU).
+
+    Mirrors ``_build_dsa_device_pool_group``: a KV entry (k_buffer [+ v_buffer])
+    plus, when the pool carries an indexer, an INDEXER entry
+    (index_k_buffer [+ index_k_scale_buffer]) sharing the FULL slot grid.
+    """
+    if kvcache.page_size != page_size:
+        raise ValueError(
+            "NPU MLA KV page size must match the tree page size: "
+            f"{kvcache.page_size} != {page_size}."
+        )
+    if getattr(kvcache, "enable_sparsity_driven_kv_offload", False) or (
+        kvcache.k_buffer is None
+    ):
+        raise ValueError(
+            "The direct external linker does not support "
+            "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD on NPU MLA models."
+        )
+    if getattr(kvcache, "dcp_size", 1) > 1:
+        raise ValueError(
+            "The direct external linker does not support DCP (dcp_size > 1) "
+            "on NPU MLA models."
+        )
+
+    num_layers = kvcache.layer_num
+    has_v = kvcache.kr_cache_dim > 0 and kvcache.v_buffer is not None
+    k_buffers = list(kvcache.k_buffer.unbind(0))
+    v_buffers = list(kvcache.v_buffer.unbind(0)) if has_v else []
+
+    draft_k, draft_v, draft_index, draft_scale = [], [], [], []
+    for pool in mtp_draft_device_pools:
+        if pool.page_size != page_size:
+            raise ValueError("NPU MLA MTP page size must match the tree page size.")
+        if pool.k_buffer is None:
+            raise ValueError(
+                "The direct external linker does not support sparsity-driven "
+                "KV offload on NPU MLA draft pools."
+            )
+        draft_k.extend(pool.k_buffer.unbind(0))
+        if has_v:
+            if pool.v_buffer is None:
+                raise ValueError("NPU MLA MTP draft pool is missing v_buffer.")
+            draft_v.extend(pool.v_buffer.unbind(0))
+        if pool.index_k_buffer is not None:
+            draft_index.extend(pool.index_k_buffer.unbind(0))
+            if pool.index_k_scale_buffer is not None:
+                draft_scale.extend(pool.index_k_scale_buffer.unbind(0))
+    if len(draft_k) != len(draft_v) or len(draft_index) != len(draft_scale):
+        raise ValueError("NPU MLA MTP k/v and indexer draft layer counts must match.")
+
+    num_draft = len(draft_k)
+    num_k_side = num_layers + num_draft
+    kv_component = k_buffers + draft_k + v_buffers + draft_v
+    layer_mapping: dict[int, int | tuple[int, ...]] = {}
+    for layer in range(num_layers):
+        k_index = layer
+        v_index = num_k_side + layer
+        if layer < num_draft:
+            draft_k_index = num_layers + layer
+            draft_v_index = num_k_side + num_layers + layer
+            layer_mapping[layer] = (
+                (k_index, draft_k_index, v_index, draft_v_index)
+                if has_v
+                else (k_index, draft_k_index)
+            )
+        else:
+            layer_mapping[layer] = (k_index, v_index) if has_v else k_index
+
+    entries = [
+        DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=kvcache,
+            components=[kv_component],
+            layer_mapping=layer_mapping,
+            page_size=page_size,
+            rows_are_pages=True,
+        )
+    ]
+
+    if kvcache.index_k_buffer is not None:
+        if kvcache.index_page_size != page_size:
+            raise ValueError(
+                "The direct external linker requires the NPU MLA indexer page "
+                f"size to match the tree page size: {kvcache.index_page_size} "
+                f"!= {page_size}."
+            )
+        index_buffers = list(kvcache.index_k_buffer.unbind(0))
+        scale_buffers = (
+            list(kvcache.index_k_scale_buffer.unbind(0))
+            if kvcache.index_k_scale_buffer is not None
+            else []
+        )
+        if draft_index and bool(draft_scale) != bool(scale_buffers):
+            raise ValueError(
+                "NPU MLA MTP draft indexer buffers must mirror the target "
+                "pool's index-scale layout."
+            )
+        # Component layout: [target_k..., draft_k..., target_scale..., draft_scale...]
+        num_index = len(index_buffers) + len(draft_index)
+        indexer_layer_mapping: dict[int, int | tuple[int, ...]] = {}
+        for global_layer, slot in kvcache.indexer_layer_id_to_slot.items():
+            local_layer = global_layer - kvcache.start_layer
+            indexer_layer_mapping[local_layer] = (
+                (slot, num_index + slot) if scale_buffers else slot
+            )
+        for depth in range(len(draft_index)):
+            draft_k_slot = len(index_buffers) + depth
+            draft_scale_slot = num_index + len(scale_buffers) + depth
+            existing = indexer_layer_mapping.get(depth)
+            if existing is None:
+                indexer_layer_mapping[depth] = (
+                    (draft_k_slot, draft_scale_slot)
+                    if scale_buffers
+                    else draft_k_slot
+                )
+            else:
+                # Draft depth shares target layer `depth`'s transfer.
+                target_parts = (
+                    list(existing) if isinstance(existing, tuple) else [existing]
+                )
+                draft_parts = (
+                    [draft_k_slot, draft_scale_slot]
+                    if scale_buffers
+                    else [draft_k_slot]
+                )
+                indexer_layer_mapping[depth] = tuple(target_parts + draft_parts)
+        indexer_component = index_buffers + draft_index + scale_buffers + draft_scale
+        entries.append(
+            DevicePoolEntry(
+                name=PoolName.INDEXER,
+                indices_from_pool=PoolName.KV,
+                device_pool=kvcache,
+                components=[indexer_component],
+                layer_mapping=indexer_layer_mapping,
+                page_size=page_size,
+                rows_are_pages=True,
+            )
+        )
+
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
 
 
