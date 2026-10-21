@@ -79,7 +79,17 @@ class LinkerMLADedupBroadcaster(MLAHostDedupBroadcaster):
             indices, _ = prepared[name]
             if indices.is_cuda:
                 indices.record_stream(device_module.current_stream())
+            # Packed entries map one model layer to several physical buffers
+            # (MLA k + v, indexer k + scale) that share the same row indices;
+            # plain entries map to a single buffer. Broadcast each sub-buffer
+            # with its own row width.
+            sub_layers = layer if isinstance(layer, tuple) else (layer,)
             for buffers in self.buffers[name]:
-                self._bcast_layer(
-                    buffers, self.kv_staging, indices, buffers[layer].shape[1], layer
-                )
+                for sub_layer in sub_layers:
+                    self._bcast_layer(
+                        buffers,
+                        self.kv_staging,
+                        indices,
+                        buffers[sub_layer].shape[1],
+                        sub_layer,
+                    )
