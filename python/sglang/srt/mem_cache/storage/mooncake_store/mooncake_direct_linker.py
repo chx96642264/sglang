@@ -29,7 +29,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
 )
-from sglang.srt.utils import freeze_gc, get_device_module
+from sglang.srt.utils import freeze_gc, get_device_module, is_npu
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
@@ -42,7 +42,14 @@ def _storage_suffix(
     if not rank_replicated:
         parts.append(f"tp{tp_rank}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
-    return "_".join(parts)
+    suffix = "_".join(parts)
+    # Keep NPU pools in their own storage keyspace: a GPU and an NPU cluster
+    # sharing one Mooncake instance would otherwise read each other's KV pages
+    # (same model + same layout hashes to identical keys). GPU keys are
+    # unchanged, so this does not break existing persisted caches on CUDA.
+    if is_npu():
+        return f"npu_{suffix}"
+    return suffix
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
@@ -161,19 +168,68 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def register_buffers(self) -> None:
         seen = set()
-        for pool in self.pools.values():
+        buffers = []
+        for name, pool in self.pools.items():
             for buffer in pool.get_hybrid_pool_buffer():
                 storage = buffer.untyped_storage()
-                allocation = (int(storage.data_ptr()), int(storage.nbytes()))
+                ptr, nbytes = int(storage.data_ptr()), int(storage.nbytes())
+                allocation = (ptr, nbytes)
                 if allocation in seen:
                     continue
                 seen.add(allocation)
-                result = self.storage.store.register_buffer(*allocation)
+                buffers.append((name, ptr, nbytes))
+        failures = []
+        if is_npu():
+            # NPU: the driver exports an IPC key for any 2MiB-aligned device
+            # address inside an aclrtMalloc allocation, but Mooncake rejects
+            # overlapping local segments. Adjacent KV buffers frequently
+            # share a 2MiB window, so per-buffer aligned ranges would
+            # overlap; merge overlapping ranges into one registration per
+            # cluster (buffers are VA-contiguous, so each cluster stays
+            # inside a single allocation).
+            align = 2 * 1024 * 1024
+            ranges = []
+            for name, ptr, nbytes in buffers:
+                start = ptr & ~(align - 1)
+                end = ((ptr + nbytes + align - 1) // align) * align
+                ranges.append((name, ptr, nbytes, start, end))
+            ranges.sort(key=lambda r: (r[3], r[4]))
+            clusters = []
+            for name, ptr, nbytes, start, end in ranges:
+                if clusters and start < clusters[-1][1]:
+                    clusters[-1][1] = max(clusters[-1][1], end)
+                    clusters[-1][2].append((name, ptr, nbytes))
+                else:
+                    clusters.append([start, end, [(name, ptr, nbytes)]])
+            for start, end, members in clusters:
+                logger.info(
+                    "mooncake register probe: cluster base=0x%x size=%d "
+                    "buffers=%d",
+                    start,
+                    end - start,
+                    len(members),
+                )
+                result = self.storage.store.register_buffer(start, end - start)
                 if result not in (0, None):
-                    raise RuntimeError(
-                        "Failed to register GPU KV buffer with Mooncake, "
-                        f"error code: {result}."
+                    logger.error(
+                        "mooncake register FAILED: cluster base=0x%x size=%d "
+                        "buffers=%d result=%s",
+                        start,
+                        end - start,
+                        len(members),
+                        result,
                     )
+                    failures.extend((m[0], m[1], m[2], result) for m in members)
+        else:
+            for name, ptr, nbytes in buffers:
+                result = self.storage.store.register_buffer(ptr, nbytes)
+                if result not in (0, None):
+                    failures.append((name, ptr, nbytes, result))
+        if failures:
+            raise RuntimeError(
+                "Failed to register GPU KV buffer with Mooncake, "
+                f"error code: {failures[0][-1]}."
+            )
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
