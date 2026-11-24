@@ -1979,7 +1979,12 @@ def setup_state_kv_args(
     )
     if isinstance(owner_view, NPUMLATokenToKVPool):
         kv_args.kv_buf_groups = 3 if owner_view.index_head_dim is not None else 2
-        kv_args.hidden_kv_layers = total_kv_layers
+        # hybrid: 分组步长是“全注意力层数”，不是模型总层数
+        kv_args.hidden_kv_layers = (
+            owner_view.layer_num
+            if kv_args.is_hybrid_mla_backend
+            else total_kv_layers
+        )
         kv_args.draft_kv_layers = (
             _token_kv_view(draft_token_to_kv_pool).layer_num
             if draft_token_to_kv_pool is not None

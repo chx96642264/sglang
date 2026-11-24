@@ -11,7 +11,7 @@ that layer's buffer into a full-size per-rank remote scratch tensor.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
 
@@ -47,6 +47,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         *args,
         layer_shard_rank: int,
         layer_shard_size: int,
+        layer_id_mapping: Optional[Sequence[int]] = None,
         **kwargs,
     ):
         assert layer_shard_rank is not None and layer_shard_size > 1, (
@@ -55,6 +56,10 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         self.layer_shard_rank = layer_shard_rank
         self.layer_shard_size = layer_shard_size
         self.layer_shard_enabled = True
+        # A3: hybrid 下池内层号是 dense 0..n-1，用全注意力层号表映射回全局。
+        self._layer_id_mapping = (
+            None if layer_id_mapping is None else tuple(layer_id_mapping)
+        )
         super().__init__(*args, **kwargs)
         # First global layer index owned by this rank (used by PD transfer to
         # label the contiguous owned-buffer range).
@@ -67,6 +72,16 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         return get_layer_shard_range(
             self.layer_shard_rank, self.layer_shard_size, self.layer_num
         )
+
+    def _model_layer_id(self, pool_layer_id: int) -> int:
+        """池内层号 → 全局模型层号。
+
+        非 hybrid：池内层号本身已是全局层号，直接返回；
+        hybrid    ：池内层号为 dense 0..n-1，用 full_attention_layer_ids 映射。
+        """
+        if self._layer_id_mapping is None:
+            return pool_layer_id
+        return self._layer_id_mapping[pool_layer_id]
 
     def _is_local_layer_owned(self, local_layer_id: int) -> bool:
         owned_start, owned_end = self._owned_local_layer_range()
@@ -690,6 +705,21 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                     self.index_k_scale_buffer[slot][tgt_flat] = (
                         self.index_k_scale_buffer[slot][src_flat]
                     )
+
+    def _owned_pool_layer_ids(self) -> list[int]:
+        start, end = self._owned_local_layer_range()
+        return list(range(self.start_layer + start, self.start_layer + end))
+
+    def get_kv_layer_ids(self):
+        owned = [self._model_layer_id(i) for i in self._owned_pool_layer_ids()]
+        if not owned:
+            return []
+        # 组数 = 条目数 / owned 层数（自动涵盖 combined-kv、fp8 v、index、scale）
+        groups = max(1, len(self._get_disagg_buffer_entries()) // len(owned))
+        return owned * groups
+
+    def get_state_layer_ids(self):
+        return [self._model_layer_id(i) for i in super().get_state_layer_ids()]
 
     def get_kv_transfer_layer_span(self, num_entries: int) -> int:
         """Layer count covered by ``num_entries`` contiguous buf entries.

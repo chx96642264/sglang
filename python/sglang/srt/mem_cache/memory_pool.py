@@ -4500,6 +4500,9 @@ class HybridLinearKVPool(KVCache):
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
+        # A3: split 池返回全局层号 × 组数，与 owned 缓冲条目一一对应。
+        if self.layer_shard_enabled:
+            return list(self.full_kv_pool.get_kv_layer_ids())
         if self.use_mla and _is_npu and layer_ids:
             data_ptrs, _, _ = self.get_contiguous_buf_infos()
             return layer_ids * (len(data_ptrs) // len(layer_ids))
@@ -4555,6 +4558,31 @@ class HybridLinearKVPool(KVCache):
                 f"{layer_id=} not in full attention layers: {self.full_attention_layer_id_mapping.keys()}"
             )
         return self.full_attention_layer_id_mapping[layer_id]
+
+    # A3: full_kv_pool 为 split 池时，向 PD/HiCache 暴露分片信息。
+    # 非 split 的 full pool 没有分片属性，必须用 getattr 兜底，否则裸访问会崩。
+    @property
+    def layer_shard_enabled(self) -> bool:
+        return getattr(self.full_kv_pool, "layer_shard_enabled", False)
+
+    @property
+    def layer_shard_rank(self) -> Optional[int]:
+        return getattr(self.full_kv_pool, "layer_shard_rank", None)
+
+    @property
+    def layer_shard_size(self) -> int:
+        return getattr(self.full_kv_pool, "layer_shard_size", 1)
+
+    @property
+    def layer_shard_start(self) -> int:
+        # hybrid: full pool 的 start_layer 为 0，故这里是 dense owned 起点
+        return getattr(
+            self.full_kv_pool, "layer_shard_start", self.start_layer
+        )
+
+    def get_kv_transfer_layer_span(self, num_entries: int) -> int:
+        span = getattr(self.full_kv_pool, "get_kv_transfer_layer_span", None)
+        return span(num_entries) if span is not None else num_entries
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
@@ -4659,6 +4687,8 @@ class HybridLinearKVPool(KVCache):
         k_scale: float = 1.0,
         v_scale: float = 1.0,
         dcp_kv_mask: Optional[torch.Tensor] = None,
+        cp_gathered_full: bool = False,
+        cp_gathered_chunk: bool = False,
     ):
         # Write-location info lives in the metadata (`KVWriteLoc`). `full_loc` is the
         # unified pool's pre-translated PHYSICAL loc (None for a static pool, where
@@ -4684,11 +4714,21 @@ class HybridLinearKVPool(KVCache):
             # MLA pools whose set_kv_buffer takes no layer_id_override (the
             # FP4 and NPU ones) address the layer by `layer.layer_id`.
             with self._transfer_id_context(layer):
+                # A3: 仅 split 池接受 CP gather 标志，避免影响其他 MLA 后端。
+                cp_flags = (
+                    {
+                        "cp_gathered_full": cp_gathered_full,
+                        "cp_gathered_chunk": cp_gathered_chunk,
+                    }
+                    if self.layer_shard_enabled
+                    else {}
+                )
                 self.full_kv_pool.set_kv_buffer(
                     layer,
                     write_loc,
                     cache_k,
                     cache_v,
+                    **cp_flags,
                 )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):

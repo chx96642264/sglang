@@ -321,5 +321,19 @@ class TestNPUGLM5_3_W8A8_1P1D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
         self.run_accuracy()
 
 
+# A3: layer-split variant of the PCP topology — the DSA KV/indexer layers are
+# sharded across the 8 prefill CP ranks (--enable-dsa-cache-layer-split), so the
+# prefill worker keeps ceil(n/shard) full-attention layers per rank. The PP=1
+# smoke (design doc Step 6/7) should pass before this PP=4 + HiCache shape.
+class TestNPUGLM5_3_W8A8_1P1D_LayerSplit_GPQA(TestNPUGLM5_3_W8A8_1P1D_PCP_GPQA):
+    """GLM-5.3-w8a8 PD 1p1d with interleave prefill-CP + DSA cache layer split."""
+
+    model_config = {
+        **GLM_5_3_PCP_PD_SEP_MODEL_CONFIG,
+        "prefill_args": GLM_5_3_PCP_PD_SEP_PREFILL_ARGS
+        + ["--enable-dsa-cache-layer-split"],
+    }
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2927,6 +2927,28 @@ class KVCacheConfigurator:
             mla_pool_class=mla_pool_class,
             dsa_pool_class=dsa_pool_class,
         )
+        # A3: hybrid 的 DSA 全注意力池接入 NPU layer-split（prefill CP）。
+        if extra_args.get("use_dsa") and _is_npu and not self.is_draft_worker:
+            from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                NPUMLATokenToKVPool,
+            )
+
+            if full_pool_class is NPUMLATokenToKVPool:
+                from sglang.srt.hardware_backend.npu.dsa_cache_layer_split import (
+                    LayerSplitNPUMLATokenToKVPool,
+                )
+                from sglang.srt.layers.cp.utils import (
+                    get_glm_dsa_cp_layer_shard_info,
+                )
+
+                rank, size = get_glm_dsa_cp_layer_shard_info(self)
+                if rank is not None and size > 1:
+                    full_pool_class = partial(
+                        LayerSplitNPUMLATokenToKVPool,
+                        layer_shard_rank=rank,
+                        layer_shard_size=size,
+                        layer_id_mapping=tuple(full_attention_layer_ids),
+                    )
         if (
             extra_args.get("use_dsa")
             and not self.is_draft_worker

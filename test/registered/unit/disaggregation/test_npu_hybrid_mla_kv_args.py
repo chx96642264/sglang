@@ -93,7 +93,8 @@ class TestNpuHybridMlaKvArgs(CustomTestCase):
 
     def _assert_target_registered(self, kv_args):
         self.assertEqual(kv_args.kv_buf_groups, 2)
-        self.assertEqual(kv_args.hidden_kv_layers, _TARGET_LAYERS)
+        # A3: hybrid 的分组步长取全注意力层数（0/2/4 共 3 层），不是模型总层数。
+        self.assertEqual(kv_args.hidden_kv_layers, 3)
         self.assertTrue(kv_args.is_hybrid_mla_backend)
         self.assertIn(StateType.MAMBA, kv_args.state_types)
 
