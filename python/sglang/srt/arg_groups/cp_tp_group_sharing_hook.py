@@ -83,8 +83,20 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
                 "CP/TP group sharing only supports DFLASH or native MTP with top-k 1."
             )
 
+    # A1: NPU GLM-5.3 + cache layer split keeps CP-TP group sharing; the PD
+    # pairing is fixed by A2 (register_to_bootstrap stops swapping TP/CP) and
+    # A3 (state peer-only), so decode pulls every prefill rank's owned layers.
+    npu_layer_split = (
+        arch == "Glm5NextForConditionalGeneration"
+        and get_platform().is_npu
+        and cfg.enable_dsa_cache_layer_split
+        and cfg.disaggregation_mode == "prefill"
+        and cfg.disaggregation_transfer_backend == "ascend"
+    )
     unsupported = {
-        "enable-dsa-cache-layer-split": cfg.enable_dsa_cache_layer_split,
+        "enable-dsa-cache-layer-split": (
+            cfg.enable_dsa_cache_layer_split and not npu_layer_split
+        ),
         "dcp-size > 1": cfg.dcp_size > 1,
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
@@ -113,8 +125,9 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
                 "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
                 "disaggregation-transfer-backend != mooncake": (
                     cfg.disaggregation_transfer_backend != "mooncake"
+                    and not npu_layer_split
                 ),
-                "pp-size > 1": cfg.pp_size > 1,
+                "pp-size > 1": cfg.pp_size > 1 and not npu_layer_split,
                 "dp-size > 1": cfg.dp_size > 1,
                 "ep-size > 1": view.ep_size > 1,
             }

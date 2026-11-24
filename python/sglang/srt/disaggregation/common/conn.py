@@ -509,10 +509,16 @@ class CommonKVManager(BaseKVManager):
         )
         # QSA state is whole or head-sharded on each rank. DSA indexer pages
         # instead need every owner, even when CP and TP share a group.
-        self.kv_shard_state_peer_only = (
-            self.kv_shard_size > 1
-            and cp_tp_group_sharing
-            and StateType.QSA_COMPRESSED in args.state_types
+        self.kv_shard_state_peer_only = cp_tp_group_sharing and (
+            (self.kv_shard_size > 1 and StateType.QSA_COMPRESSED in args.state_types)
+            # A3: NPU GLM-5.3 + cache layer split keeps kv_shard_size == 1,
+            # but the Mamba head shards stay TP-partitioned under CP-TP group
+            # sharing, so only the rank-matched peer may write each decode
+            # state slot (see _is_request_peer).
+            or (
+                get_parallel().enable_dsa_cache_layer_split
+                and StateType.MAMBA in args.state_types
+            )
         )
 
         # bind zmq socket
@@ -691,12 +697,15 @@ class CommonKVManager(BaseKVManager):
         """Why a decode cannot read this prefill's KV pages, if it cannot:
         each prefill rank owns only a subset of them, so every decode
         attention-TP rank must pull from every prefill rank."""
-        if required_dst_info_num == self.kv_shard_size:
+        # A3: under cache layer split each rank owns a subset of the layers
+        # (kv_shard_size == 1), so the fan-in width is the CP size instead.
+        expected = self.kv_shard_size if self.kv_shard_size > 1 else self.attn_cp_size
+        if required_dst_info_num == expected:
             return None
         return (
             "KV cache sharding needs every decode attention-TP rank to pull "
             f"from every prefill rank, but {required_dst_info_num} of "
-            f"{self.kv_shard_size} decode ranks registered for a request; the "
+            f"{expected} decode ranks registered for a request; the "
             "decode may predate KV-shard fan-in for CP-TP group sharing"
         )
 
@@ -1890,8 +1899,17 @@ class CommonKVManager(BaseKVManager):
         attn_tp = (self.attn_tp_size, self.attn_tp_rank)
         attn_cp = (self.attn_cp_size, self.attn_cp_rank)
         if get_parallel().enable_cp_tp_group_sharing:
-            # Decode pairs its TP rank r with this CP rank r (see __init__).
-            attn_tp, attn_cp = attn_cp, (1, 0)
+            if get_parallel().enable_dsa_cache_layer_split:
+                # A2: under cache layer split each rank holds only its own
+                # layers, so register the true attn_tp=(1, 0) and keep
+                # attn_cp=(N, r): the bootstrap counts N prefill ranks and
+                # every decode rank fans in from all of them
+                # (_resolve_rank_mapping's layer-split CP branch) instead of
+                # pairing one rank to one.
+                attn_tp = (1, 0)
+            else:
+                # Decode pairs its TP rank r with this CP rank r (see __init__).
+                attn_tp, attn_cp = attn_cp, (1, 0)
         payload = {
             "attn_tp_size": attn_tp[0],
             "attn_tp_rank": attn_tp[1],
