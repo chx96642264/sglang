@@ -1418,6 +1418,19 @@ class Glm5NextForConditionalGeneration(nn.Module):
     ) -> None:
         if quant_config is None or quant_config.get_name() != "modelslim":
             return
+        # ModelSlimConfig.apply_weight_name_mapper keeps the checkpoint keys and
+        # adds the runtime ones, so a description with ``forget_gate`` names
+        # already carries ``<prefix>.f_a_proj.weight`` once the mapper drops
+        # ``.forget_gate.``. Registering the checkpoint name as a packed
+        # component as well would describe one tensor as both a whole and a
+        # split layout, which ModelSlim rejects as ambiguous.
+        if any(
+            isinstance(name, str)
+            and name.endswith(".f_a_proj.weight")
+            and ".forget_gate." not in name
+            for name in quant_config.quant_description
+        ):
+            return
         quant_config.update_packed_modules_mapping(
             {
                 "f_a_proj": ["forget_gate.f_a_proj"],

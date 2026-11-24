@@ -274,20 +274,37 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         cp_group = get_parallel().attn_cp_group
         # torch.distributed expects the *global* rank of the source.
         src = cp_group.ranks[owner_rank]
+        # fp8 store mode packs the rope half into the K record, so there is no
+        # separate V side (kr_cache_dim == 0) and nothing to broadcast. The
+        # condition is config-only, so every rank skips the V collective
+        # together and the broadcasts stay paired.
+        has_v = self.kr_cache_dim > 0
         if self.layer_shard_rank == owner_rank:
             k_buf = self.k_buffer[offset].view(-1, self.kv_cache_dim)[:slice_tokens]
-            v_buf = self.v_buffer[offset].view(-1, self.kr_cache_dim)[:slice_tokens]
+            v_buf = (
+                self.v_buffer[offset].view(-1, self.kr_cache_dim)[:slice_tokens]
+                if has_v
+                else None
+            )
         else:
             k_buf = self.remote_k_buffer.view(-1, self.kv_cache_dim)[:slice_tokens]
-            v_buf = self.remote_v_buffer.view(-1, self.kr_cache_dim)[:slice_tokens]
-        return [
+            v_buf = (
+                self.remote_v_buffer.view(-1, self.kr_cache_dim)[:slice_tokens]
+                if has_v
+                else None
+            )
+        works = [
             torch.distributed.broadcast(
                 k_buf, src=src, group=cp_group.device_group, async_op=True
-            ),
-            torch.distributed.broadcast(
-                v_buf, src=src, group=cp_group.device_group, async_op=True
-            ),
+            )
         ]
+        if v_buf is not None:
+            works.append(
+                torch.distributed.broadcast(
+                    v_buf, src=src, group=cp_group.device_group, async_op=True
+                )
+            )
+        return works
 
     def _broadcast_buffer_from_owner(
         self,
@@ -591,11 +608,12 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                 loc.view(-1, 1),
                 cache_k.view(-1, 1, self.kv_lora_rank),
             )
-            torch_npu.npu_scatter_nd_update_(
-                self.remote_v_buffer.view(-1, 1, self.qk_rope_head_dim),
-                loc.view(-1, 1),
-                cache_v.view(-1, 1, self.qk_rope_head_dim),
-            )
+            if self.kr_cache_dim > 0:
+                torch_npu.npu_scatter_nd_update_(
+                    self.remote_v_buffer.view(-1, 1, self.qk_rope_head_dim),
+                    loc.view(-1, 1),
+                    cache_v.view(-1, 1, self.qk_rope_head_dim),
+                )
         self.remote_kv_layer_id = layer.layer_id
 
     def set_index_k_buffer(
