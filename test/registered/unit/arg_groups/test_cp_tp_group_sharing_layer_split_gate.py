@@ -1,8 +1,7 @@
 """CP-TP group sharing admits NPU GLM-5.3 prefill cache layer split (A1).
 
-The narrow predicate (Glm5Next + NPU + split + PD prefill + ascend backend)
-lifts the split / mooncake / pp bans; every other combination keeps the
-original behavior.
+The narrow predicate (Glm5Next + NPU + split + PD prefill + mooncake backend)
+lifts the split ban only; every other combination keeps the original behavior.
 """
 
 import unittest
@@ -26,6 +25,7 @@ _BACKEND_BAN = (
     "disaggregation-transfer-backend != mooncake is not supported with "
     "CP-TP group sharing."
 )
+_PP_BAN = "pp-size > 1 is not supported with CP-TP group sharing."
 
 _GLM5 = SimpleNamespace(
     hf_config=SimpleNamespace(architectures=["Glm5NextForConditionalGeneration"])
@@ -53,7 +53,7 @@ def _server_args(hf=_GLM5, **kw):
         speculative_algorithm=None,
         enable_dsa_cache_layer_split=True,
         disaggregation_mode="prefill",
-        disaggregation_transfer_backend="ascend",
+        disaggregation_transfer_backend="mooncake",
         pp_size=1,
         dp_size=1,
         dcp_size=1,
@@ -74,7 +74,9 @@ def _server_args(hf=_GLM5, **kw):
 def _run(server_args, *, is_npu=True):
     with patch(_PLATFORM, return_value=_platform(is_npu=is_npu)):
         with patch(_MAMBAISH, return_value=_LINEAR):
-            resolve_cp_tp_group_sharing(server_args, SimpleNamespace())
+            # The hook reads model.hf_config.architectures; _server_args keeps
+            # the model config object on server_args.hf_config.
+            resolve_cp_tp_group_sharing(server_args, server_args.hf_config)
 
 
 class TestNpuLayerSplitAdmitted(CustomTestCase):
@@ -85,16 +87,11 @@ class TestNpuLayerSplitAdmitted(CustomTestCase):
         self.assertEqual(source, "resolve_cp_tp_group_sharing")
         self.assertTrue(fields["enable_cp_tp_group_sharing"])
 
-    def test_t2_pp4_is_admitted(self):
-        server_args = _server_args(pp_size=4)
-        _run(server_args)
-        _, fields = server_args._resolved_overrides[-1]
-        self.assertTrue(fields["enable_cp_tp_group_sharing"])
-
     def test_bans_without_split_stay(self):
-        # The mooncake/pp exemption rides on the predicate, not on PD alone.
+        # The backend ban rides on mooncake, not on the split predicate.
         cases = {
-            "ascend backend without split": _server_args(
+            "non-mooncake backend without split": _server_args(
+                disaggregation_transfer_backend="ascend",
                 enable_dsa_cache_layer_split=False,
             ),
         }
@@ -110,22 +107,39 @@ class TestNpuLayerSplitNotAdmitted(CustomTestCase):
             _run(_server_args(), is_npu=False)
 
     def test_other_models_still_reject_split(self):
-        for hf in (_KIMI31, _QWEN4):
+        # Give each model its required cp_strategy so the strategy check does
+        # not fire first and mask the split ban being asserted here.
+        for hf, strategy in ((_KIMI31, "interleave"), (_QWEN4, "zigzag")):
             with self.subTest(hf.hf_config.architectures[0]):
                 with self.assertRaisesRegex(ValueError, _SPLIT_BAN):
-                    _run(_server_args(hf=hf))
+                    _run(_server_args(hf=hf, cp_strategy=strategy))
 
     def test_non_pd_prefill_still_rejects_split(self):
+        # The split ban precedes the decode ban in the unsupported dict order.
         for mode in ("null", "decode"):
             with self.subTest(mode=mode):
-                expected = _DECODE_BAN if mode == "decode" else _SPLIT_BAN
-                with self.assertRaisesRegex(ValueError, expected):
+                with self.assertRaisesRegex(ValueError, _SPLIT_BAN):
                     _run(_server_args(disaggregation_mode=mode))
 
-    def test_non_ascend_backend_still_rejects_split(self):
+    def test_decode_without_split_rejected(self):
+        with self.assertRaisesRegex(ValueError, _DECODE_BAN):
+            _run(
+                _server_args(
+                    disaggregation_mode="decode",
+                    enable_dsa_cache_layer_split=False,
+                )
+            )
+
+    def test_non_mooncake_backend_still_rejects_split(self):
         # Not the target backend, so the narrow predicate is false.
         with self.assertRaisesRegex(ValueError, _SPLIT_BAN):
-            _run(_server_args(disaggregation_transfer_backend="mooncake"))
+            _run(_server_args(disaggregation_transfer_backend="ascend"))
+
+    def test_pp_gt_1_still_rejected_with_split(self):
+        # pp > 1 is banned again regardless of the split predicate, so the
+        # on/off-split A/B comparison stays symmetric.
+        with self.assertRaisesRegex(ValueError, _PP_BAN):
+            _run(_server_args(pp_size=4))
 
 
 if __name__ == "__main__":

@@ -91,7 +91,7 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         and get_platform().is_npu
         and cfg.enable_dsa_cache_layer_split
         and cfg.disaggregation_mode == "prefill"
-        and cfg.disaggregation_transfer_backend == "ascend"
+        and cfg.disaggregation_transfer_backend == "mooncake"
     )
     unsupported = {
         "enable-dsa-cache-layer-split": (
@@ -125,9 +125,8 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
                 "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
                 "disaggregation-transfer-backend != mooncake": (
                     cfg.disaggregation_transfer_backend != "mooncake"
-                    and not npu_layer_split
                 ),
-                "pp-size > 1": cfg.pp_size > 1 and not npu_layer_split,
+                "pp-size > 1": cfg.pp_size > 1,
                 "dp-size > 1": cfg.dp_size > 1,
                 "ep-size > 1": view.ep_size > 1,
             }

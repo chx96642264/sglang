@@ -388,30 +388,27 @@ def handle_model_specific_adjustments(server_args: Any):
                     "--enable-dsa-cache-layer-split requires "
                     "--enable-prefill-cp and --cp-strategy interleave."
                 )
-            # Layer split relies on an all-CP-rank KV/indexer transfer path:
-            # mooncake on GPU, the ascend engine (memfabric_hybrid) on NPU.
-            # mori/nixl support is a temporary limitation and will be added
-            # later by the community.
-            allowed_transfer_backend = "ascend" if get_platform().is_npu else "mooncake"
+            # Layer split relies on an all-CP-rank KV/indexer transfer path
+            # through the mooncake backend. mori/nixl support is a temporary
+            # limitation and will be added later by the community.
             if (
                 cfg.enable_dsa_cache_layer_split
-                and cfg.disaggregation_transfer_backend != allowed_transfer_backend
+                and cfg.disaggregation_transfer_backend != "mooncake"
             ):
                 raise ValueError(
                     "--enable-dsa-cache-layer-split currently only supports "
-                    "the mooncake transfer backend on GPU, or ascend on NPU. Got "
+                    "the mooncake transfer backend. Got "
                     f"--disaggregation-transfer-backend "
                     f"{cfg.disaggregation_transfer_backend!r}. mori/nixl "
                     "support will be added later by the community."
                 )
             if cfg.enable_dsa_cache_layer_split and cfg.pp_size > 1:
-                if not get_platform().is_npu:
-                    raise ValueError(
-                        "--enable-dsa-cache-layer-split is not supported with "
-                        "pipeline parallelism (pp_size > 1) yet. It requires "
-                        "prefill context parallelism, and CP + PP has not been "
-                        "validated for this feature."
-                    )
+                raise ValueError(
+                    "--enable-dsa-cache-layer-split is not supported with "
+                    "pipeline parallelism (pp_size > 1) yet. It requires "
+                    "prefill context parallelism, and CP + PP has not been "
+                    "validated for this feature."
+                )
 
         else:
             # DeepSeek V3/R1/V3.1
