@@ -3025,17 +3025,27 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_indices: list[int],
         dst_gpu_id: int,
     ):
+        # KV entries follow the CP-owned layer_shard_start under layer split,
+        # but DSA tail buffers cover every full-attention layer of this PP
+        # stage. Use the tail-specific start so the peer slice stays inside
+        # its layer count.
+        tail_start_layer = getattr(self.kv_args, "dsa_tail_start_layer", None)
+        if tail_start_layer is None:
+            tail_start_layer = self.kv_args.prefill_start_layer
+        tail_end_layer = (
+            tail_start_layer + len(src_data_ptrs) // 2 if src_data_ptrs else None
+        )
         dst_data_ptrs = slice_dsa_tail_dst_ptrs_for_pp(
             src_data_ptrs,
             dst_data_ptrs,
-            self.kv_args.prefill_start_layer,
-            self.kv_args.prefill_end_layer,
+            tail_start_layer,
+            tail_end_layer,
         )
         dst_item_lens = slice_dsa_tail_dst_ptrs_for_pp(
             src_data_ptrs,
             dst_item_lens,
-            self.kv_args.prefill_start_layer,
-            self.kv_args.prefill_end_layer,
+            tail_start_layer,
+            tail_end_layer,
         )
         transfer_blocks = build_dsa_tail_transfer_blocks(
             src_data_ptrs,

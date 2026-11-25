@@ -374,6 +374,16 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
         )
         kv_args.kv_layout = get_pd_kv_layout(self.token_to_kv_pool)
+        # DSA tail buffers are always allocated for every full-attention layer
+        # of this PP stage (NPUMLATokenToKVPool creates them in its base
+        # __init__), even when layer split shards the KV entries across CP
+        # ranks. Their peer-side start must therefore be the PP stage's
+        # full-attention offset, never the CP-owned layer_shard_start used for
+        # KV entries. Otherwise src=[6,12) overruns a 11-layer peer.
+        kv_args.dsa_tail_start_layer = _transfer_start_layer(
+            pool=self.token_to_kv_pool,
+            hf_text_config=self.scheduler.model_config.hf_text_config,
+        )
         layer_shard_enabled = getattr(
             self.token_to_kv_pool, "layer_shard_enabled", False
         )

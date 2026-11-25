@@ -56,6 +56,7 @@ from sglang.srt.disaggregation.utils import (
     pp_sync_polls,
     setup_state_kv_args,
     should_send_replicated_state,
+    slice_dsa_tail_dst_ptrs_for_pp,
 )
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
@@ -2073,6 +2074,57 @@ class TestQwen4StateWire(unittest.TestCase):
         writes.assert_called_once_with(
             "decode", [(0x1000 + 64, 0x5000 + 128, 16), (0x3000 + 64, 0x7000 + 128, 16)]
         )
+
+    def test_dsa_tail_layer_split_uses_pp_stage_start(self):
+        """Layer split shards KV entries by CP-owned layers, but every DSA tail
+        buffer of the PP stage is registered. Slicing tails with the CP-owned
+        prefill_start_layer overruns an 11-layer peer ([6,12)); the dedicated
+        PP-relative tail start must be used instead."""
+        src_ptrs = [0x1000 + i * 0x100 for i in range(12)]  # 6 layers x K/S
+        dst_ptrs = [0x5000 + i * 0x100 for i in range(22)]  # 11 layers x K/S
+        mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+        mgr.kv_args = SimpleNamespace(
+            kv_data_ptrs=[],
+            kv_data_lens=[],
+            aux_data_ptrs=[],
+            aux_data_lens=[],
+            state_data_ptrs=[src_ptrs],
+            state_data_lens=[[512] * len(src_ptrs)],
+            gpu_id=0,
+            prefill_start_layer=6,  # CP-owned KV start (wrong for tails)
+            prefill_end_layer=12,
+            dsa_tail_start_layer=5,  # PP stage full-attention offset
+        )
+        writes = Mock(return_value=0)
+        mgr.transport = MooncakeTransport(engine=engine_writes(writes))
+        mgr._local_keys = BufferKeys.for_buffers([], [], [src_ptrs])
+        mgr.register_buffer_to_engine()
+        peer_keys = BufferKeys.for_buffers([], [], [dst_ptrs])
+        mgr._peers = {
+            "decode": PeerBuffers(
+                remote=mgr.transport.import_registration(
+                    session_id="decode",
+                    bases=dict(peer_keys.pair([], [], [dst_ptrs])),
+                ),
+                keys=peer_keys,
+            )
+        }
+
+        rc = mgr._send_slot_state(
+            SimpleNamespace(mooncake_session_id="decode"),
+            src_item_lens=[64] * len(src_ptrs),
+            dst_item_lens=[64] * len(dst_ptrs),
+            src_indices=[1, 0, 1, 0, 0, 4],
+            dst_indices=[2, 0, 1, 0, 0, 4],
+            label="dsa_tail",
+            src_keys=mgr._local_keys.state[0],
+            dst_keys=peer_keys.state[0],
+        )
+
+        self.assertEqual(rc, 0)
+        writes.assert_called_once()
+        # The first copied entry lands on decode's K layer 5 (dst_ptrs[5]).
+        self.assertEqual(writes.call_args.args[1][0][1], dst_ptrs[5] + 128)
 
     def test_stride_check_accepts_one_sided_elided_dsa_entry(self):
         """A prefill that elides a shared-topk layer's index-K must still pair

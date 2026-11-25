@@ -3087,17 +3087,29 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_keys: Sequence[MooncakeBufferKey],
     ) -> int:
         try:
+            # KV entries follow the CP-owned layer_shard_start under layer
+            # split, but DSA tail buffers cover every full-attention layer of
+            # this PP stage. Use the tail-specific start so the peer slice
+            # stays inside its layer count.
+            tail_start_layer = getattr(
+                self.kv_args, "dsa_tail_start_layer", None
+            )
+            if tail_start_layer is None:
+                tail_start_layer = self.kv_args.prefill_start_layer
+            tail_end_layer = (
+                tail_start_layer + len(src_keys) // 2 if src_keys else None
+            )
             dst_entries = slice_dsa_tail_dst_ptrs_for_pp(
                 list(range(len(src_keys))),
                 list(range(len(dst_keys))),
-                self.kv_args.prefill_start_layer,
-                self.kv_args.prefill_end_layer,
+                tail_start_layer,
+                tail_end_layer,
             )
             dst_item_lens = slice_dsa_tail_dst_ptrs_for_pp(
                 list(range(len(src_keys))),
                 dst_item_lens,
-                self.kv_args.prefill_start_layer,
-                self.kv_args.prefill_end_layer,
+                tail_start_layer,
+                tail_end_layer,
             )
             if not (
                 len(src_keys)

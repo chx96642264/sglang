@@ -146,6 +146,13 @@ class KVArgs:
     # Only used of npu, for decode total kv layers
     draft_kv_layers: int
     num_draft_entries: int = 0
+    # Start layer of the DSA compress-tail buffers in the peer's full-attention
+    # layer space. Under --enable-dsa-cache-layer-split the KV entries are
+    # CP-owned slices (hence prefill_start_layer follows layer_shard_start),
+    # but every DSA tail buffer of this PP stage is registered. Using the KV
+    # start for tails shifts the peer slice by the CP-owned offset and can run
+    # past the peer's layer count. None means "use prefill_start_layer".
+    dsa_tail_start_layer: Optional[int] = None
 
 
 class KVPoll:
