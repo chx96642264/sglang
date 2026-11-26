@@ -19,7 +19,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
 from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils.device import is_npu
 
 if is_npu():
@@ -543,9 +543,24 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
             self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
         if self.remote_kv_layer_id == layer_id:
             self.remote_kv_layer_id = None
+        # With radix cache on, `had_remote_copy` alone cannot authorize the
+        # patch-write: the marker can be stale from a previous request whose
+        # rows live elsewhere in the scratch, while a radix-hit request only
+        # scatter-writes its new suffix rows -- the follow-up get would then
+        # short-circuit on inherited, wrong prefix rows and read another
+        # request's KV/index silently. Without radix cache every request
+        # writes all of its rows here, so the patch-write covers the whole
+        # request footprint regardless of the marker. Config-only so the
+        # get-time broadcast decision stays paired across the CP group.
         if (
             cp_gathered_full
-            or (cp_gathered_chunk and (prefix_broadcast_pending or had_remote_copy))
+            or (
+                cp_gathered_chunk
+                and (
+                    prefix_broadcast_pending
+                    or (had_remote_copy and get_memory().disable_radix_cache)
+                )
+            )
         ) and self._remote_store_supported():
             if self._is_layer_owned(layer_id):
                 super().set_kv_buffer(layer, loc_info, cache_k, cache_v)
@@ -634,9 +649,19 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         # A write invalidates any cached remote copy before the owned-only
         # early return, so the next read re-broadcasts on every rank.
         self.invalidate_index_layer(layer_id)
+        # Same radix guard as set_kv_buffer: with radix cache on a stale
+        # `had_remote_copy` marker must not authorize a suffix-only
+        # patch-write, or the follow-up read short-circuits on another
+        # request's inherited index rows.
         if (
             cp_gathered_full
-            or (cp_gathered_chunk and (prefix_broadcast_pending or had_remote_copy))
+            or (
+                cp_gathered_chunk
+                and (
+                    prefix_broadcast_pending
+                    or (had_remote_copy and get_memory().disable_radix_cache)
+                )
+            )
         ) and self._remote_index_store_supported():
             if self._is_layer_owned(layer_id):
                 super().set_index_k_buffer(layer_id, loc, index_k)
