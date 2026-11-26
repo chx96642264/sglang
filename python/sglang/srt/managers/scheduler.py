@@ -5981,6 +5981,24 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         self.deferred_responses.stream_released()
+        # Debug: unconditional entry probe, bypasses the logging pipeline.
+        try:
+            import time as _t
+
+            with open(
+                f"/tmp/split_kv_sched_cp{get_parallel().attn_cp_rank}.log", "a"
+            ) as _f:
+                _f.write(
+                    f"{_t.time():.3f} probe pbr pid={os.getpid()} "
+                    f"fm={batch.forward_mode} disagg={self.disaggregation_mode} "
+                    f"n_reqs={len(batch.reqs)}\n"
+                )
+        except Exception as _e:  # noqa: BLE001
+            try:
+                with open("/tmp/split_kv_probe_err.log", "a") as _f:
+                    _f.write(f"pbr probe failed: {_e!r}\n")
+            except Exception:
+                pass
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)

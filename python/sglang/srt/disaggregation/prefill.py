@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import sys
 import time
 from array import array
 from collections import deque
@@ -1226,6 +1228,9 @@ class SchedulerDisaggregationPrefillMixin:
         Transfer kv for prefill completed requests and add it into disagg_prefill_transfer_queue
         Adapted from process_batch_result_prefill
         """
+        self._debug_kv_checksum_file(
+            f"probe prbr_fn entry n_reqs={len(batch.reqs)} fm={batch.forward_mode}"
+        )
         (
             logits_output,
             next_token_ids,
@@ -1293,13 +1298,14 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            self._debug_kv_checksum_file(
+                f"probe prbr loop i={i} room={req.bootstrap_room} "
+                f"is_chunked={req is batch.chunked_req} "
+                f"pending_boot={req.pending_bootstrap} "
+                f"aborted={is_aborted(req)}"
+            )
             if req is not batch.chunked_req:
                 req.time_stats.set_prefill_finished_time()
-                self._debug_kv_checksum_file(
-                    f"probe prbr entry room={req.bootstrap_room} "
-                    f"pending_boot={req.pending_bootstrap} "
-                    f"aborted={is_aborted(req)}"
-                )
 
                 # Its KV never landed: abort instead of sending it to decode.
                 if req.discard_output_reason is not None:
@@ -1882,15 +1888,25 @@ class SchedulerDisaggregationPrefillMixin:
 
     def _debug_kv_checksum_file(self, text: str) -> None:
         """Debug: append straight to a per-rank file, bypassing the logging
-        pipeline so the record survives any log-level / log-capture filtering."""
+        pipeline so the record survives any log-level / log-capture filtering.
+        A failed write is itself diagnostic, so record it to a side file (or
+        stderr) instead of vanishing."""
         try:
             with open(
                 f"/tmp/split_kv_prefill_cp{get_parallel().attn_cp_rank}.log",
                 "a",
             ) as f:
                 f.write(f"{time.time():.3f} {text}\n")
-        except OSError:
-            pass
+        except Exception as e:
+            try:
+                with open("/tmp/split_kv_probe_err.log", "a") as f:
+                    f.write(f"{time.time():.3f} pid={os.getpid()} write failed: {e!r} text={text[:80]}\n")
+            except Exception:
+                print(
+                    f"split-kv probe write failed: {e!r} text={text[:80]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     def _log_split_per_entry_kv_checksums(self, req: Req, page_indices_gpu) -> None:
         """Layer split's owned-only KV entries make this rank's digest
