@@ -17,12 +17,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
 )
-from sglang.srt.utils import (
-    is_gfx95_supported,
-    is_gfx942_supported,
-    is_hip,
-    is_npu,
-)
+from sglang.srt.utils import is_gfx95_supported, is_gfx942_supported, is_hip
 from sglang.srt.utils.device import is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
@@ -74,12 +69,6 @@ _AITER_MHC_IMPORT_WARNED = False
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
-    # NPU: there is no fused post+pre kernel. The Triton path is gated to
-    # gfx95/gfx1250 and the aiter path to HIP, so enabling this would route
-    # into the TileLang kernel, which is CUDA-only. hc_pre/hc_post have their
-    # own CANN ops, so the unfused chain is the supported NPU path.
-    if is_npu():
-        return False
     # gfx1250: TileLang doesn't compile; the fused cross-layer path routes
     # entirely through the Triton mhc_post_pre (try_fused_hc_post_pre).
     # Gate only on SGLANG_OPT_FUSE_MHC_POST_PRE; TileLang switches don't apply.
