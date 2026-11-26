@@ -1295,11 +1295,19 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             if req is not batch.chunked_req:
                 req.time_stats.set_prefill_finished_time()
+                self._debug_kv_checksum_file(
+                    f"probe prbr entry room={req.bootstrap_room} "
+                    f"pending_boot={req.pending_bootstrap} "
+                    f"aborted={is_aborted(req)}"
+                )
 
                 # Its KV never landed: abort instead of sending it to decode.
                 if req.discard_output_reason is not None:
                     req.request_finish(req.discard_output_reason)
                 if is_aborted(req):
+                    self._debug_kv_checksum_file(
+                        f"probe prbr exit abort room={req.bootstrap_room}"
+                    )
                     if self._retire_aborted_prefill_result(req):
                         req.time_stats.set_completion_time()
                         aborted_reqs.append(req)
@@ -1308,6 +1316,9 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # Test hook: exercise the release/requeue retry path.
                 if req.pending_bootstrap and should_force_retry(req):
+                    self._debug_kv_checksum_file(
+                        f"probe prbr exit force_retry room={req.bootstrap_room}"
+                    )
                     self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
                     continue
@@ -1323,6 +1334,9 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                     )
                 if sampling_mask_finish_reason is not None:
+                    self._debug_kv_checksum_file(
+                        f"probe prbr exit sampling_mask room={req.bootstrap_room}"
+                    )
                     req.request_finish(sampling_mask_finish_reason)
                     req.time_stats.trace_ctx.abort(
                         abort_info={"reason": sampling_mask_finish_reason.message}
@@ -1346,6 +1360,9 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                     req.grammar.finished = req.finished()
                     if is_aborted(req):
+                        self._debug_kv_checksum_file(
+                            f"probe prbr exit grammar_abort room={req.bootstrap_room}"
+                        )
                         if self._retire_aborted_prefill_result(req):
                             req.time_stats.set_completion_time()
                             aborted_reqs.append(req)
@@ -1829,6 +1846,9 @@ class SchedulerDisaggregationPrefillMixin:
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
     ) -> None:
+        self._debug_kv_checksum_file(
+            f"probe send entry room={req.bootstrap_room} last_chunk={last_chunk}"
+        )
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk:
             if computer is None:
