@@ -919,6 +919,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
             storage=storage,
         )
+        _xprobe_layer_ids_summary(kv_args)
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         setup_page_row_kv_args(
@@ -4678,3 +4679,30 @@ class SchedulerDisaggregationDecodeMixin:
                 # Give completed host transfers device space before new arrivals.
                 self._preallocate_new_requests()
         return prealloc_deferred
+
+
+def _xprobe_layer_ids_summary(kv_args) -> None:
+    """Debug one-shot structural probe on decode: the full dst layer-id list
+    this rank registered. Pair with the prefill per-rank summaries
+    (/tmp/split_kv_prefill_cp*.log): every prefill rank's published ids must
+    be a disjoint subset whose union equals this list."""
+    if getattr(_xprobe_layer_ids_summary, "_logged", False):
+        return
+    _xprobe_layer_ids_summary._logged = True
+    ids = list(kv_args.kv_layer_ids or [])
+    uniq = sorted(set(ids))
+    n, u = len(ids), len(uniq)
+    line = (
+        f"kv_layer_ids stage=register n={n} uniq={u} "
+        f"groups={n // u if u else 0} "
+        f"min={uniq[0] if uniq else None} max={uniq[-1] if uniq else None} "
+        f"head={ids[:8]} tail={ids[-8:]}"
+    )
+    logger.info("%s", line)
+    try:
+        with open(
+            f"/tmp/split_kv_decode_tp{get_parallel().attn_tp_rank}.log", "a"
+        ) as f:
+            f.write(f"{time.time():.3f} {line}\n")
+    except OSError:
+        pass

@@ -1908,6 +1908,23 @@ class SchedulerDisaggregationPrefillMixin:
                     flush=True,
                 )
 
+    def _xprobe_pf_layer_ids_summary(self, stage: str) -> None:
+        """One-shot structural probe: how many KV entries this rank publishes
+        and which global layer ids they carry. Under layer split this must be
+        n = owned layers x groups (a strict subset of decode's full list); a
+        decode-side n should be the full set, and the union of every prefill
+        rank's ids must equal it with no overlap."""
+        kv_args = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args
+        ids = list(kv_args.kv_layer_ids or [])
+        uniq = sorted(set(ids))
+        n, u = len(ids), len(uniq)
+        self._xprobe_pf_file(
+            f"kv_layer_ids stage={stage} n={n} uniq={u} "
+            f"groups={n // u if u else 0} "
+            f"min={uniq[0] if uniq else None} max={uniq[-1] if uniq else None} "
+            f"head={ids[:8]} tail={ids[-8:]}"
+        )
+
     def _xprobe_pf_split_digests(self, req: Req, page_indices_gpu) -> None:
         """Layer split's owned-only KV entries make this rank's digest
         incomparable with the decode's (kv_layout_signature differs), so the
@@ -1949,6 +1966,9 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server
         """
+        if not getattr(self, "_xprobe_pf_layer_ids_logged", False):
+            self._xprobe_pf_layer_ids_logged = True
+            self._xprobe_pf_layer_ids_summary("send")
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
