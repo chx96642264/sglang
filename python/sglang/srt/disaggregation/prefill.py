@@ -1228,7 +1228,7 @@ class SchedulerDisaggregationPrefillMixin:
         Transfer kv for prefill completed requests and add it into disagg_prefill_transfer_queue
         Adapted from process_batch_result_prefill
         """
-        self._debug_kv_checksum_file(
+        self._xprobe_pf_file(
             f"probe prbr_fn entry n_reqs={len(batch.reqs)} fm={batch.forward_mode}"
         )
         (
@@ -1298,7 +1298,7 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
-            self._debug_kv_checksum_file(
+            self._xprobe_pf_file(
                 f"probe prbr loop i={i} room={req.bootstrap_room} "
                 f"is_chunked={req is batch.chunked_req} "
                 f"pending_boot={req.pending_bootstrap} "
@@ -1311,7 +1311,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if req.discard_output_reason is not None:
                     req.request_finish(req.discard_output_reason)
                 if is_aborted(req):
-                    self._debug_kv_checksum_file(
+                    self._xprobe_pf_file(
                         f"probe prbr exit abort room={req.bootstrap_room}"
                     )
                     if self._retire_aborted_prefill_result(req):
@@ -1322,7 +1322,7 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # Test hook: exercise the release/requeue retry path.
                 if req.pending_bootstrap and should_force_retry(req):
-                    self._debug_kv_checksum_file(
+                    self._xprobe_pf_file(
                         f"probe prbr exit force_retry room={req.bootstrap_room}"
                     )
                     self.optimistic_release_and_requeue(req)
@@ -1340,7 +1340,7 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                     )
                 if sampling_mask_finish_reason is not None:
-                    self._debug_kv_checksum_file(
+                    self._xprobe_pf_file(
                         f"probe prbr exit sampling_mask room={req.bootstrap_room}"
                     )
                     req.request_finish(sampling_mask_finish_reason)
@@ -1366,7 +1366,7 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                     req.grammar.finished = req.finished()
                     if is_aborted(req):
-                        self._debug_kv_checksum_file(
+                        self._xprobe_pf_file(
                             f"probe prbr exit grammar_abort room={req.bootstrap_room}"
                         )
                         if self._retire_aborted_prefill_result(req):
@@ -1423,7 +1423,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if not req.pending_bootstrap:
                     self.send_kv_chunk(req, last_chunk=True)
                 else:
-                    self._debug_kv_checksum_file(
+                    self._xprobe_pf_file(
                         f"probe parked pending_bootstrap room={req.bootstrap_room}"
                     )
                 req.time_stats.set_prefill_transfer_queue_entry_time()
@@ -1852,17 +1852,17 @@ class SchedulerDisaggregationPrefillMixin:
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
     ) -> None:
-        self._debug_kv_checksum_file(
+        self._xprobe_pf_file(
             f"probe send entry room={req.bootstrap_room} last_chunk={last_chunk}"
         )
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk:
             if computer is None:
-                self._debug_kv_checksum_file(
+                self._xprobe_pf_file(
                     f"probe send last_chunk computer=None room={req.bootstrap_room}"
                 )
             elif is_health_check_req(req):
-                self._debug_kv_checksum_file(
+                self._xprobe_pf_file(
                     f"probe send last_chunk health-check room={req.bootstrap_room}"
                 )
                 digest = signature = 0
@@ -1880,13 +1880,13 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 digest = computer.compute(page_indices_gpu, state_indices)
                 if get_parallel().enable_dsa_cache_layer_split:
-                    self._log_split_per_entry_kv_checksums(req, page_indices_gpu)
+                    self._xprobe_pf_split_digests(req, page_indices_gpu)
                 signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
             if computer is not None:
                 self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
         self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
 
-    def _debug_kv_checksum_file(self, text: str) -> None:
+    def _xprobe_pf_file(self, text: str) -> None:
         """Debug: append straight to a per-rank file, bypassing the logging
         pipeline so the record survives any log-level / log-capture filtering.
         A failed write is itself diagnostic, so record it to a side file (or
@@ -1908,7 +1908,7 @@ class SchedulerDisaggregationPrefillMixin:
                     flush=True,
                 )
 
-    def _log_split_per_entry_kv_checksums(self, req: Req, page_indices_gpu) -> None:
+    def _xprobe_pf_split_digests(self, req: Req, page_indices_gpu) -> None:
         """Layer split's owned-only KV entries make this rank's digest
         incomparable with the decode's (kv_layout_signature differs), so the
         shipped digest is skipped on decode. Log a digest per entry instead:
@@ -1935,7 +1935,7 @@ class SchedulerDisaggregationPrefillMixin:
             get_parallel().attn_cp_rank,
             " ".join(fields),
         )
-        self._debug_kv_checksum_file(
+        self._xprobe_pf_file(
             f"room={req.bootstrap_room} cp_rank={get_parallel().attn_cp_rank} "
             f"{' '.join(fields)}"
         )
