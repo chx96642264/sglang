@@ -1916,7 +1916,7 @@ class SchedulerDisaggregationPrefillMixin:
         (bootstrap_room, layer id) to localize the first diverging layer.
         Both the logger and a per-rank file dump are written -- the file dump
         bypasses the logging pipeline entirely."""
-        kv_args = self.kv_manager.kv_args
+        kv_args = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args
         layer_ids = list(kv_args.kv_layer_ids or [])
         fields = []
         for entry, (ptr, item_len) in enumerate(
