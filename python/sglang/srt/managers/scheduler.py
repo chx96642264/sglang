@@ -5988,10 +5988,20 @@ class Scheduler(
             with open(
                 f"/tmp/split_kv_sched_cp{get_parallel().attn_cp_rank}.log", "a"
             ) as _f:
+                _prbr = type(self).process_batch_result_disagg_prefill
+                _has_probe = any(
+                    isinstance(c, str) and "probe prbr_fn" in c
+                    for c in _prbr.__code__.co_consts
+                )
                 _f.write(
                     f"{_t.time():.3f} probe pbr pid={os.getpid()} "
                     f"fm={batch.forward_mode} disagg={self.disaggregation_mode} "
-                    f"n_reqs={len(batch.reqs)}\n"
+                    f"n_reqs={len(batch.reqs)} "
+                    f"dllm={batch.is_dllm()} "
+                    f"sched_dllm={self.dllm_config is not None} "
+                    f"prbr_file={_prbr.__code__.co_filename} "
+                    f"prbr_line={_prbr.__code__.co_firstlineno} "
+                    f"has_probe={_has_probe}\n"
                 )
         except Exception as _e:  # noqa: BLE001
             try:
