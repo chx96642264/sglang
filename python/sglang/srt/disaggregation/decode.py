@@ -24,6 +24,7 @@ import contextlib
 import hashlib
 import logging
 import random
+import os
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -3425,8 +3426,18 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         idx = decode_req.metadata_buffer_index
         if self.scheduler.kv_checksum_computer is not None:
             digest, signature = self.metadata_buffers.get_kv_checksum(idx)
-            decode_req.req.expected_kv_checksum = (
-                digest if self._kv_checksum_comparable(signature) else 0
+            comparable = self._kv_checksum_comparable(signature)
+            decode_req.req.expected_kv_checksum = digest if comparable else 0
+            # A digest over another layout means a layer-split prefill (owned-
+            # only entries): the whole-request verify is skipped, so flag the
+            # request for a per-entry digest log at verify time. A fake
+            # transfer (decode warmup) reads a metadata slot no prefill wrote,
+            # so its garbage digest means nothing.
+            decode_req.req.split_kv_checksum_debug = bool(
+                digest
+                and not comparable
+                and not _is_fake_transfer(decode_req.req)
+                and not is_health_check_req(decode_req.req)
             )
         (
             output_id,
@@ -4324,6 +4335,9 @@ class SchedulerDisaggregationDecodeMixin:
                 or is_health_check_req(req)
                 or not kv_manager.should_verify_kv_checksum(_bootstrap_addr(req))
             ):
+                if getattr(req, "split_kv_checksum_debug", False):
+                    req.split_kv_checksum_debug = False
+                    self._log_split_per_entry_kv_checksums(kv_manager.kv_args, req)
                 continue
             # Verified once. A retraction restores the row after decode has
             # written its own tokens into the last page, so the handoff digest
@@ -4373,6 +4387,56 @@ class SchedulerDisaggregationDecodeMixin:
                 self._handle_kv_checksum_mismatch(req, msg)
         batch.filter_batch(
             keep_indices=[i for i, bad in enumerate(mismatched) if not bad]
+        )
+
+    def _debug_kv_checksum_file(self, text: str, logger_name: str = "decode") -> None:
+        """Debug: append straight to a per-rank file, bypassing the logging
+        pipeline so the record survives any log-level / log-capture filtering."""
+        try:
+            with open(
+                f"/tmp/split_kv_{logger_name}_tp{get_parallel().attn_tp_rank}.log",
+                "a",
+            ) as f:
+                f.write(f"{time.time():.3f} {text}\n")
+        except OSError:
+            pass
+
+    def _log_split_per_entry_kv_checksums(self, kv_args, req: Req) -> None:
+        """The prefill shipped a digest over another layout (a layer-split
+        prefill owns only its entries), so the whole-request verify is
+        skipped. Log this rank's digest per KV entry instead; it pairs with
+        the prefill's logs on (bootstrap_room, layer id) to localize the
+        first diverging layer."""
+        origin_input_ids = getattr(req, "origin_input_ids", None)
+        if origin_input_ids is None or getattr(req, "kv", None) is None:
+            # A stub request (warmup) without the transfer metadata.
+            return
+        seq_len = len(origin_input_ids)
+        page_indices_gpu = page_indices_for_request(
+            self, req, seq_len, start_idx=req.kv.cache_protected_len
+        )
+        layer_ids = list(kv_args.kv_layer_ids or [])
+        fields = []
+        for entry, (ptr, item_len) in enumerate(
+            zip(kv_args.kv_data_ptrs, kv_args.kv_item_lens)
+        ):
+            digest = KvChecksumComputer(
+                device=page_indices_gpu.device,
+                kv_data_ptrs=[ptr],
+                kv_item_lens=[item_len],
+            ).compute(page_indices_gpu)
+            layer_id = layer_ids[entry] if entry < len(layer_ids) else -1
+            fields.append(f"{layer_id}:{digest:#x}")
+        logger.info(
+            "split KV checksums side=decode room=%s tp_rank=%d %s",
+            req.bootstrap_room,
+            get_parallel().attn_tp_rank,
+            " ".join(fields),
+        )
+        self._debug_kv_checksum_file(
+            f"room={req.bootstrap_room} tp_rank={get_parallel().attn_tp_rank} "
+            f"{' '.join(fields)}",
+            logger_name="decode",
         )
 
     def _handle_kv_checksum_mismatch(self, req: Req, msg: str) -> None:

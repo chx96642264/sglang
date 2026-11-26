@@ -356,6 +356,24 @@ class PrefillBootstrapQueue:
             self.scheduler.kv_checksum_computer = KvChecksumComputer.for_kv_args(
                 kv_args, torch.device(f"cuda:{get_device().gpu_id}")
             )
+            # Debug: probe straight to the per-rank file so we can verify this
+            # code version is actually running and inspect the split layout.
+            try:
+                import os as _os
+
+                with open(
+                    f"/tmp/split_kv_prefill_cp{get_parallel().attn_cp_rank}.log", "a"
+                ) as _f:
+                    _f.write(
+                        f"{time.time():.3f} probe init checksum computer "
+                        f"pid={_os.getpid()} "
+                        f"split_flag={get_parallel().enable_dsa_cache_layer_split} "
+                        f"n_entries={len(kv_args.kv_data_ptrs)} "
+                        f"item_lens={list(kv_args.kv_item_lens)} "
+                        f"layer_ids={list(kv_args.kv_layer_ids or [])}\n"
+                    )
+            except OSError:
+                pass
         else:
             self.scheduler.kv_checksum_computer = None
 
@@ -1381,6 +1399,10 @@ class SchedulerDisaggregationPrefillMixin:
                     req.disagg_kv_sender.mark_prefill_complete()
                 if not req.pending_bootstrap:
                     self.send_kv_chunk(req, last_chunk=True)
+                else:
+                    self._debug_kv_checksum_file(
+                        f"probe parked pending_bootstrap room={req.bootstrap_room}"
+                    )
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
             else:
@@ -1808,8 +1830,15 @@ class SchedulerDisaggregationPrefillMixin:
         end_idx: Optional[int] = None,
     ) -> None:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
-        if last_chunk and computer is not None:
-            if is_health_check_req(req):
+        if last_chunk:
+            if computer is None:
+                self._debug_kv_checksum_file(
+                    f"probe send last_chunk computer=None room={req.bootstrap_room}"
+                )
+            elif is_health_check_req(req):
+                self._debug_kv_checksum_file(
+                    f"probe send last_chunk health-check room={req.bootstrap_room}"
+                )
                 digest = signature = 0
             else:
                 if end_idx is None:
@@ -1824,9 +1853,56 @@ class SchedulerDisaggregationPrefillMixin:
                     self, req, end_idx, start_idx=start_idx
                 )
                 digest = computer.compute(page_indices_gpu, state_indices)
+                if get_parallel().enable_dsa_cache_layer_split:
+                    self._log_split_per_entry_kv_checksums(req, page_indices_gpu)
                 signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
-            self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
+            if computer is not None:
+                self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
         self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+
+    def _debug_kv_checksum_file(self, text: str) -> None:
+        """Debug: append straight to a per-rank file, bypassing the logging
+        pipeline so the record survives any log-level / log-capture filtering."""
+        try:
+            with open(
+                f"/tmp/split_kv_prefill_cp{get_parallel().attn_cp_rank}.log",
+                "a",
+            ) as f:
+                f.write(f"{time.time():.3f} {text}\n")
+        except OSError:
+            pass
+
+    def _log_split_per_entry_kv_checksums(self, req: Req, page_indices_gpu) -> None:
+        """Layer split's owned-only KV entries make this rank's digest
+        incomparable with the decode's (kv_layout_signature differs), so the
+        shipped digest is skipped on decode. Log a digest per entry instead:
+        the decode logs its own, and the two sides pair on
+        (bootstrap_room, layer id) to localize the first diverging layer.
+        Both the logger and a per-rank file dump are written -- the file dump
+        bypasses the logging pipeline entirely."""
+        kv_args = self.kv_manager.kv_args
+        layer_ids = list(kv_args.kv_layer_ids or [])
+        fields = []
+        for entry, (ptr, item_len) in enumerate(
+            zip(kv_args.kv_data_ptrs, kv_args.kv_item_lens)
+        ):
+            digest = KvChecksumComputer(
+                device=page_indices_gpu.device,
+                kv_data_ptrs=[ptr],
+                kv_item_lens=[item_len],
+            ).compute(page_indices_gpu)
+            layer_id = layer_ids[entry] if entry < len(layer_ids) else -1
+            fields.append(f"{layer_id}:{digest:#x}")
+        logger.info(
+            "split KV checksums side=prefill room=%s cp_rank=%d %s",
+            req.bootstrap_room,
+            get_parallel().attn_cp_rank,
+            " ".join(fields),
+        )
+        self._debug_kv_checksum_file(
+            f"room={req.bootstrap_room} cp_rank={get_parallel().attn_cp_rank} "
+            f"{' '.join(fields)}"
+        )
 
     def _send_kv_chunk(
         self: Scheduler,
