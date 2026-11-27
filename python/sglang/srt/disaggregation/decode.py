@@ -3420,44 +3420,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return False
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
-        # TEMP DEBUG (kv-route gate): D-side per-layer full-attn K abs-sum,
-        # after poll Success and before the first decode forward reads KV.
-        # -1.0-style N/A is not expected here; all-zero rows on all but one
-        # layer would confirm the KV routing gap. Judge only seq_len>0 rows;
-        # if enable_staging is True the data may still sit in staging buffers.
-        try:
-            hybrid_pool = self.tree_cache.token_to_kv_pool_allocator.get_kvcache()
-            pool = hybrid_pool
-            if getattr(pool, "use_dsa", False):
-                pool = pool.full_kv_pool
-            kbuf = getattr(pool, "k_buffer", None)  # [L, pages, ps, 1, dim]
-            if isinstance(kbuf, torch.Tensor):
-                req_row = int(decode_req.req.kv.req_pool_idx)
-                seq_len = len(decode_req.req.origin_input_ids)
-                kv_idx = self.tree_cache.req_to_token_pool.req_to_token[
-                    req_row, :seq_len
-                ].long()
-                flat = kbuf.reshape(kbuf.shape[0], -1, kbuf.shape[-1])
-                sums = [
-                    float(flat[l][kv_idx].float().abs().sum().item())
-                    for l in range(flat.shape[0])
-                ]
-                model_lids = list(
-                    getattr(hybrid_pool, "full_attention_layer_id_mapping", {}).keys()
-                )
-                logger.info(
-                    "[kv-gate] rank=%d req_row=%d seq_len=%d staging=%s "
-                    "model_lids=%s k_abs_sum=%s",
-                    self.tp_rank,
-                    req_row,
-                    seq_len,
-                    self.enable_staging,
-                    model_lids,
-                    ["%.1f" % s for s in sums],
-                )
-        except Exception as e:  # noqa: BLE001 - debug dump must never break commit
-            logger.warning("[kv-gate] dump failed: %r", e)
-
         # Keep the checksum before the metadata slot is freed; it is verified
         # when the request enters a batch.
         idx = decode_req.metadata_buffer_index

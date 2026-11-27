@@ -422,6 +422,31 @@ class PrefillBootstrapQueue:
             and (not _is_npu or get_parallel().pp_group.is_last_rank)
             else None
         )
+        # Layer-split PD transfer: append one transfer-scratch entry per KV
+        # buffer group so this rank can deliver the FULL layer set to its 1:1
+        # decode peer (owned layers from the pool, the rest pulled from their
+        # owners into the scratch at send time). They sit after the main
+        # entries and before any draft entries.
+        layer_split_scratch_start = 0
+        layer_split_scratch_ids: List[int] = []
+        if layer_shard_enabled:
+            split_pool = getattr(self.token_to_kv_pool, "full_kv_pool", None) or (
+                self.token_to_kv_pool
+            )
+            get_scratch = getattr(
+                split_pool, "get_layer_split_transfer_scratch_buf_infos", None
+            )
+            if get_scratch is not None:
+                (
+                    scratch_ptrs,
+                    scratch_lens,
+                    scratch_item_lens,
+                    layer_split_scratch_ids,
+                ) = get_scratch()
+                layer_split_scratch_start = len(kv_data_ptrs)
+                kv_data_ptrs += scratch_ptrs
+                kv_data_lens += scratch_lens
+                kv_item_lens += scratch_item_lens
         num_draft_entries = 0
         if draft_kv_pool is not None:
             # Draft KV shares target virtual ids. Unified target KV is transferred
@@ -445,13 +470,21 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
         kv_args.num_draft_entries = num_draft_entries
-        kv_args.kv_layer_ids = build_kv_layer_ids(
+        kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
             draft_token_to_kv_pool=draft_kv_pool,
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
             storage=storage,
         )
+        if layer_split_scratch_start:
+            main_entries = len(kv_layer_ids) - num_draft_entries
+            kv_layer_ids = (
+                kv_layer_ids[:main_entries]
+                + layer_split_scratch_ids
+                + kv_layer_ids[main_entries:]
+            )
+        kv_args.kv_layer_ids = kv_layer_ids
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (
@@ -507,6 +540,16 @@ class PrefillBootstrapQueue:
             self.is_mla_backend,
             **kv_manager_kwargs,
         )
+        if layer_split_scratch_start and hasattr(
+            kv_manager, "setup_layer_split_transfer"
+        ):
+            split_pool = getattr(self.token_to_kv_pool, "full_kv_pool", None) or (
+                self.token_to_kv_pool
+            )
+            kv_manager.setup_layer_split_transfer(
+                pool=split_pool,
+                scratch_start=layer_split_scratch_start,
+            )
         # main_kv_page_row implies the Mooncake manager, the only one that packs.
         if kv_args.main_kv_page_row and kv_args.draft_kv_head_num:
             kv_manager.set_draft_kv_tensors(
@@ -1966,36 +2009,6 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
             def _dsa_tail_payload():
-                pool = self.token_to_kv_pool_allocator.get_kvcache()
-                if getattr(pool, "use_dsa", False):
-                    pool = pool.full_kv_pool
-                # TEMP DEBUG (layer-split gate): dump owned vs non-owned tail
-                # abs-sum per layer. shape[0]==0 entries are skip_topk layers
-                # (reported as -1.0); all-zero rows on non-owned layers are
-                # the expected root-cause signature. Judge only n_valid>0.
-                if getattr(pool, "layer_shard_enabled", False) and getattr(
-                    pool, "_compress_tail_k", None
-                ) is not None:
-                    req_row = int(req.kv.req_pool_idx)
-                    n_valid = int(seq_len) % int(pool.index_kpool)
-                    owned_start, owned_end = pool._owned_local_layer_range()
-                    sums = [
-                        float(t[req_row].float().abs().sum().item())
-                        if t.shape[0] > 0
-                        else -1.0
-                        for t in pool._compress_tail_k
-                    ]
-                    logger.info(
-                        "[split-gate] rank=%d req_row=%d seq_len=%d n_valid=%d "
-                        "owned=[%d,%d) k_abs_sum=%s",
-                        get_parallel().attn_cp_rank,
-                        req_row,
-                        int(seq_len),
-                        n_valid,
-                        owned_start,
-                        owned_end,
-                        ["%.1f" % s for s in sums],
-                    )
                 return get_dsa_tail_state_indices(
                     self.token_to_kv_pool_allocator.get_kvcache(),
                     req.kv.req_pool_idx,

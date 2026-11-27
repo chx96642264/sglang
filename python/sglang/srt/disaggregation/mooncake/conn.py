@@ -412,6 +412,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             envs.SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES.get()
         )
         self.enable_trace = get_observability().enable_trace
+        # Layer-split PD transfer (prefill): the pool and the scratch-entry
+        # index are injected by Prefill._init_kv_manager. On every role this
+        # manager init also touches the dedicated p2p group so that
+        # torch.distributed.new_group is called uniformly by all ranks.
+        self._layer_split_pool = None
+        self._layer_split_scratch_start = 0
+        if get_parallel().enable_dsa_cache_layer_split:
+            # Lazy: keeps the NPU pool module out of non-NPU imports.
+            from sglang.srt.hardware_backend.npu.dsa_cache_layer_split import (
+                get_layer_split_p2p_group,
+            )
+
+            get_layer_split_p2p_group()
         # Set by teardown() to make worker threads exit (P<->D role switch).
         self._stopped = False
         self._worker_threads: List[threading.Thread] = []
@@ -463,6 +476,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if transfer_thread_pool_size is None:
                 transfer_thread_pool_size = min(max(4, int(0.5 * cpu_count) // 8), 12)
             transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
+            if get_parallel().enable_dsa_cache_layer_split:
+                # The layer-split fetch protocol matches p2p ops by per-pair
+                # order, which requires every shard to walk the chunk schedule
+                # identically; multiple queues would let worker threads
+                # interleave different requests' chunks differently per rank.
+                transfer_queue_size = 1
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
@@ -1379,6 +1398,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         ``dst_device_entries`` lists the destination entries that use
         ``dst_device_data_indices``.
         """
+        # Layer-split prefill sends the FULL layer set to its 1:1 decode peer:
+        # owned layers straight from the pool, non-owned layers first pulled
+        # from their owners into the transfer scratch.
+        if state_type is None and self._layer_split_pool is not None:
+            return self._send_kvcache_layer_split(
+                mooncake_session_id=mooncake_session_id,
+                item_lens=item_lens,
+                prefill_data_indices=prefill_data_indices,
+                dst_data_indices=dst_data_indices,
+                src_layer_ids=src_layer_ids,
+                dst_layer_ids=dst_layer_ids,
+                dst_item_lens=dst_item_lens,
+                bootstrap_room=bootstrap_room,
+                src_keys=src_keys,
+                dst_keys=dst_keys,
+            )
         # Host and device buffers may use different destination page spaces.
         # Build both transfer plans once, then select per destination buffer.
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
@@ -1530,6 +1565,128 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     return ret
             return 0
 
+    def setup_layer_split_transfer(self, pool, scratch_start: int) -> None:
+        """Enable the layer-split full-layer send path (prefill only).
+
+        ``pool`` is the LayerSplitNPUMLATokenToKVPool (owner lookup + p2p
+        fetch), ``scratch_start`` the kv_data_ptrs index of the first transfer
+        scratch entry appended by the prefill.
+        """
+        self._layer_split_pool = pool
+        self._layer_split_scratch_start = scratch_start
+
+    def _send_kvcache_layer_split(
+        self,
+        *,
+        mooncake_session_id: str,
+        item_lens: list[int],
+        prefill_data_indices: npt.NDArray[np.int32],
+        dst_data_indices: npt.NDArray[np.int32],
+        src_layer_ids: Optional[List[int]],
+        dst_layer_ids: Optional[List[int]],
+        dst_item_lens: list[int] | None,
+        bootstrap_room: Optional[int],
+        src_keys: Sequence[MooncakeBufferKey],
+        dst_keys: Sequence[MooncakeBufferKey],
+    ) -> int:
+        """Layer-split prefill: deliver EVERY model layer to the 1:1 decode
+        peer. Owned layers are read straight from the pool; a non-owned layer
+        is first pulled from its owner into the transfer scratch (p2p on the
+        dedicated group) and sent from there. Non-owned layers share one
+        scratch per buffer group, so their transfers are serialized one layer
+        at a time; each pull+write completes before the scratch is refilled.
+        """
+        pool = self._layer_split_pool
+        if dst_item_lens is not None and (
+            mooncake_session_id not in self.state_strides_validated
+        ):
+            mismatch = self._state_stride_mismatch(
+                num_src_entries=len(src_keys),
+                num_dst_entries=len(dst_keys),
+                item_lens=item_lens,
+                dst_item_lens=dst_item_lens,
+                state_type=None,
+                force_flat=False,
+                src_layer_ids=src_layer_ids,
+                dst_layer_ids=dst_layer_ids,
+            )
+            if mismatch is not None:
+                logger.error(mismatch)
+                if bootstrap_room is not None:
+                    self.conclude_failure(
+                        bootstrap_room=bootstrap_room,
+                        failure_reason=mismatch,
+                    )
+                return -1
+
+        # The kv buffer entries carry real layer ids on both sides and share
+        # the group order, so layers pair positionally within their id; the
+        # scratch entries (appended before any draft entries) serve every
+        # non-owned layer one layer at a time.
+        src_entries_by_layer: Dict[int, List[int]] = defaultdict(list)
+        dst_entries_by_layer: Dict[int, List[int]] = defaultdict(list)
+        for i, layer_id in enumerate(src_layer_ids or []):
+            src_entries_by_layer[layer_id].append(i)
+        for j, layer_id in enumerate(dst_layer_ids or []):
+            dst_entries_by_layer[layer_id].append(j)
+        scratch_entries = list(
+            range(self._layer_split_scratch_start, len(src_keys))
+        )
+
+        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
+            prefill_data_indices, dst_data_indices
+        )
+        units = group_units(prefill_kv_blocks, dst_kv_blocks)
+        # Bound of the p2p pulls in pool rows: the transfer indices are page
+        # slots, the pool scratches are token-major flat rows. Every shard
+        # derives it from the same SPMD chunk schedule.
+        bound = 0
+        if prefill_data_indices.size:
+            bound = (int(prefill_data_indices.max()) + 1) * self.kv_args.page_size
+
+        # Drain the previous chunk's owner sends before this chunk's pulls
+        # begin; owners and receivers walk the same SPMD chunk order.
+        pool.layer_transfer_wait_sends()
+
+        for layer_id in sorted(dst_entries_by_layer):
+            dst_entries = dst_entries_by_layer[layer_id]
+            if pool._is_layer_owned(layer_id):
+                # Serve the peers' pulls of this layer while sending ours.
+                pool.layer_transfer_serve(layer_id, bound)
+                src_entries = src_entries_by_layer.get(layer_id)
+                if src_entries is None:
+                    error = (
+                        "Layer-split prefill has no entry for owned layer "
+                        f"{layer_id}: src_layer_ids={sorted(src_entries_by_layer)[:8]}..."
+                    )
+                    logger.error(error)
+                    if bootstrap_room is not None:
+                        self.conclude_failure(
+                            bootstrap_room=bootstrap_room,
+                            failure_reason=error,
+                        )
+                    return -1
+            else:
+                # Pull the owner's rows into the transfer scratch first; the
+                # copies below read the scratch tail entries.
+                pool.layer_transfer_fetch(layer_id, bound)
+                src_entries = scratch_entries
+            copies = []
+            for i, j in zip(src_entries, dst_entries):
+                if item_lens[i] == 0:
+                    continue
+                copies.append(
+                    Copy(
+                        src=src_keys[i],
+                        dst=dst_keys[j],
+                        ranges=units * item_lens[i],
+                    )
+                )
+            ret = self._transfer_copies(mooncake_session_id, copies)
+            if ret != 0:
+                return ret
+        return 0
+
     def _generic_entry_pairs(
         self,
         *,
@@ -1567,8 +1724,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 # An entry elided on either side moves no bytes and has no
                 # registered buffer to write into.
-                # TEMP DEBUG (layer-split accuracy): dump the actual pairs.
-                paired = [
+                return [
                     (i, j, item_lens[i])
                     for i, j in pairs
                     if not is_elided_entry(
@@ -1578,18 +1734,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         allow_dst_elision=state_type == StateType.DSA,
                     )
                 ]
-                logger.info(
-                    "[split-debug] generic pairs: state=%s force_flat=%s "
-                    "src_ids=%s src_lens=%s dst_n=%d dst_lens=%s pairs(src,dst,len)=%s",
-                    state_type,
-                    force_flat,
-                    list(src_layer_ids or []),
-                    list(item_lens)[:6],
-                    num_dst_entries,
-                    (list(dst_item_lens)[:6] if dst_item_lens else None),
-                    paired[:8],
-                )
-                return paired
             src_layers, dst_layers, layers_current_pp_stage = (
                 self.get_mla_kv_ptrs_with_pp(src_entries, dst_entries, state_type)
             )
@@ -2820,21 +2964,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_indices = (
                 req.dst_state_indices[i] if i < len(req.dst_state_indices) else []
             )
-            # TEMP DEBUG (layer-split accuracy): dump one line per state
-            # component (MAMBA does not go through _generic_entry_pairs, so it
-            # never shows up in that grep).
-            logger.info(
-                "[split-debug] extra state=%s n_src_keys=%d n_dst_keys=%d "
-                "src_lens=%s dst_lens=%s src_lids=%s dst_lids=%s n_idx=%s",
-                getattr(st, "name", st),
-                len(src_keys),
-                len(dst_keys),
-                list(src_item_lens)[:6],
-                (list(dst_item_lens)[:6] if dst_item_lens else None),
-                list(src_state_layer_ids)[:6],
-                (list(dst_state_layer_ids)[:6] if dst_state_layer_ids else None),
-                [len(x) if x is not None else None for x in ([indices, dst_indices])],
-            )
 
             if st == StateType.MAMBA:
                 if (not src_dim_per_tensor or not dst_dim_per_tensor) and list(
@@ -3560,47 +3689,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
-                        # TEMP DEBUG (layer-split accuracy): dump the dispatch
-                        # branch selection once per chunk transfer.
-                        logger.info(
-                            "[split-debug] dispatch: is_dcp=%s skip_kv=%s "
-                            "skip_state=%s mla=%s hybrid=%s n_src_idx=%d "
-                            "n_dst_idx=%d prefill_dcp=%d dst_dcp=%d dst_tp=%d "
-                            "state_types=%s src_kv_item_lens=%s "
-                            "dst_kv_item_lens=%s dst_state_item_lens=%s "
-                            "group_sharing=%s",
-                            is_dcp_transfer,
-                            skip_kv,
-                            skip_state,
-                            self.is_mla_backend,
-                            self.is_hybrid_mla_backend,
-                            len(kv_chunk.prefill_kv_indices),
-                            len(chunked_dst_kv_indice),
-                            self.dcp_size,
-                            target_rank_registration_info.dst_dcp_size,
-                            target_rank_registration_info.dst_attn_tp_size,
-                            [
-                                getattr(st, "name", st)
-                                for st in getattr(self.kv_args, "state_types", []) or []
-                            ],
-                            list(self.kv_args.kv_item_lens)[:8],
-                            (
-                                list(target_rank_registration_info.dst_kv_item_lens)[:8]
-                                if target_rank_registration_info.dst_kv_item_lens
-                                else None
-                            ),
-                            (
-                                [
-                                    list(x)[:4]
-                                    for x in target_rank_registration_info.dst_state_item_lens[
-                                        :3
-                                    ]
-                                ]
-                                if target_rank_registration_info.dst_state_item_lens
-                                else None
-                            ),
-                            get_parallel().enable_cp_tp_group_sharing,
-                        )
                         if (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
@@ -3739,11 +3827,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             break
 
                         if kv_chunk.is_last_chunk:
-                            is_request_peer = (
-                                not self.kv_shard_state_peer_only
-                                and not self.layer_split_state_peer_only
-                            ) or self._is_request_peer(
-                                target_rank_registration_info.dst_tp_rank
+                            is_request_peer = not self.kv_shard_state_peer_only or (
+                                self._is_request_peer(
+                                    target_rank_registration_info.dst_tp_rank
+                                )
                             )
                             if (
                                 kv_chunk.state_indices

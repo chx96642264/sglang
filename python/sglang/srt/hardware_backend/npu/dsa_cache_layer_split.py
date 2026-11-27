@@ -32,6 +32,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_LAYER_SPLIT_P2P_GROUP = None
+
+
+def get_layer_split_p2p_group():
+    """A dedicated world-wide device group for PD transfer-time owner pulls.
+
+    Layer-split prefill ranks pull non-owned layers from their owners with
+    point-to-point send/recv while the scheduler thread keeps issuing owner
+    broadcasts on the CP device group. Sharing one communicator across both
+    threads would let the two op streams interleave differently on different
+    ranks and deadlock the collectives, so the pulls run on their own group.
+    ``new_group`` must be called uniformly by every rank (both PD roles reach
+    it through their KV manager init), hence the world-wide group.
+    """
+    global _LAYER_SPLIT_P2P_GROUP
+    if _LAYER_SPLIT_P2P_GROUP is None:
+        _LAYER_SPLIT_P2P_GROUP = torch.distributed.new_group()
+    return _LAYER_SPLIT_P2P_GROUP
+
+
 class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
     """NPU MLA KV pool that shards layers across CP ranks with owner-broadcast reads.
 
@@ -219,6 +239,41 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                         dtype=torch.float32,
                         device=self.device,
                     )
+            # Dedicated PD-transfer scratches, one full-size layer per buffer
+            # group. The transfer thread pulls non-owned layers here (p2p from
+            # the owner) and RDMA-sends them to the decode peer; they are kept
+            # separate from the remote_* scratches above because the forward
+            # path refills those while transfers of earlier chunks may still
+            # be reading them.
+            self.transfer_k_scratch = torch.empty(
+                (kv_pages, self.page_size, 1, self.kv_cache_dim),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            self.transfer_v_scratch = None
+            if not self.dsa_kv_cache_store_c8:
+                self.transfer_v_scratch = torch.empty(
+                    (kv_pages, self.page_size, 1, self.kr_cache_dim),
+                    dtype=_v_dtype,
+                    device=self.device,
+                )
+            self.transfer_index_k_scratch = None
+            self.transfer_index_scale_scratch = None
+            if self.index_head_dim is not None:
+                self.transfer_index_k_scratch = torch.empty(
+                    (index_pages, self.index_page_size, 1, self.index_head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                if self.index_k_scale_buffer is not None:
+                    self.transfer_index_scale_scratch = torch.empty(
+                        (index_pages, self.index_page_size, 1),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+            # Outstanding owner-side p2p send handles for the transfer fetch
+            # protocol (see layer_transfer_serve / layer_transfer_wait_sends).
+            self._transfer_send_works: list = []
 
         self.remote_kv_layer_id: Optional[int] = None
         self.remote_index_layer_id: Optional[int] = None
@@ -250,6 +305,143 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         if not used_bound or used_bound <= 0:
             return self._kv_capacity_tokens
         return min(used_bound, self._kv_capacity_tokens)
+
+    # ------------------------------------------------------------------
+    # PD transfer-time owner pulls. The KV sender thread fetches non-owned
+    # layers from their owners with point-to-point ops on the dedicated
+    # group (get_layer_split_p2p_group) and sends them to the decode peer
+    # from the transfer_*_scratch buffers, so every rank can deliver the
+    # FULL layer set to its 1:1 decode peer without holding all layers.
+    # ------------------------------------------------------------------
+
+    def get_layer_split_transfer_scratch_buf_infos(self):
+        """Registered-buffer infos for the PD transfer scratches.
+
+        One entry per KV buffer group (k, v?, index_k, scale? — mirroring the
+        owned entries' group order), labeled with a real non-owned layer id so
+        the ``kv_layer_ids``/``kv_data_ptrs`` length invariant holds. The
+        layer-split send path maps every non-owned layer onto these shared
+        entries one layer at a time.
+        """
+        owned = self._kv_buffer_layer_ids()
+        first_remote = owned.start if owned.start > self.start_layer else owned.stop
+        ptrs, lens, item_lens = [], [], []
+
+        def _add(tensor: torch.Tensor) -> None:
+            ptrs.append(tensor.data_ptr())
+            lens.append(tensor.nbytes())
+            item_lens.append(tensor[0].nbytes())
+
+        _add(self.transfer_k_scratch)
+        if self.transfer_v_scratch is not None:
+            _add(self.transfer_v_scratch)
+        if self.transfer_index_k_scratch is not None:
+            _add(self.transfer_index_k_scratch)
+            if self.transfer_index_scale_scratch is not None:
+                _add(self.transfer_index_scale_scratch)
+        return ptrs, lens, item_lens, [first_remote] * len(ptrs)
+
+    def _transfer_layer_p2p_pairs(
+        self, layer_id: int, used_bound: int
+    ) -> list[tuple[Optional[torch.Tensor], torch.Tensor]]:
+        """(owner_src_or_None, transfer_scratch_dst) views for one layer.
+
+        The p2p op set and its order are config-derived and identical on every
+        shard, so owner isends and peer irecvs match pairwise; the source half
+        is None exactly on ranks that do not own the layer.
+        """
+        owned = self._is_layer_owned(layer_id)
+        offset = self._kv_local_offset(layer_id) if owned else None
+        k_bound = self._kv_slice_tokens(used_bound)
+        pairs = [
+            (
+                (
+                    self.k_buffer[offset].view(-1, self.kv_cache_dim)[:k_bound]
+                    if owned
+                    else None
+                ),
+                self.transfer_k_scratch.view(-1, self.kv_cache_dim)[:k_bound],
+            )
+        ]
+        if self.transfer_v_scratch is not None:
+            pairs.append(
+                (
+                    (
+                        self.v_buffer[offset].view(-1, self.kr_cache_dim)[:k_bound]
+                        if owned
+                        else None
+                    ),
+                    self.transfer_v_scratch.view(-1, self.kr_cache_dim)[:k_bound],
+                )
+            )
+        if self.transfer_index_k_scratch is not None:
+            # The indexer pages live in their own slot space (index page size
+            # need not match the KV page size), so pull the layer's whole
+            # index rows instead of deriving a bound from the KV slots.
+            n_elems = self.transfer_index_k_scratch.numel()
+            slot = (
+                self.indexer_layer_id_to_slot.get(layer_id) if owned else None
+            )
+            pairs.append(
+                (
+                    (
+                        self.index_k_buffer[slot].view(-1)[:n_elems]
+                        if slot is not None
+                        else None
+                    ),
+                    self.transfer_index_k_scratch.view(-1),
+                )
+            )
+            if self.transfer_index_scale_scratch is not None:
+                n_scales = self.transfer_index_scale_scratch.numel()
+                pairs.append(
+                    (
+                        (
+                            self.index_k_scale_buffer[slot].view(-1)[:n_scales]
+                            if slot is not None
+                            else None
+                        ),
+                        self.transfer_index_scale_scratch.view(-1),
+                    )
+                )
+        return pairs
+
+    def layer_transfer_fetch(self, layer_id: int, used_bound: int) -> None:
+        """Receiver side: pull one non-owned layer's rows from its owner into
+        the transfer scratch (synchronous)."""
+        owner_rank = self._get_layer_owner_rank(layer_id)
+        cp_group = get_parallel().attn_cp_group
+        group = get_layer_split_p2p_group()
+        works = [
+            torch.distributed.irecv(dst, src=cp_group.ranks[owner_rank], group=group)
+            for _src, dst in self._transfer_layer_p2p_pairs(layer_id, used_bound)
+        ]
+        for work in works:
+            work.wait()
+
+    def layer_transfer_serve(self, layer_id: int, used_bound: int) -> None:
+        """Owner side: post async sends of one owned layer's rows to every
+        peer shard. Posting order matches the peers' pull order (layers
+        ascend within a chunk; chunks follow the SPMD schedule)."""
+        if self._get_layer_owner_rank(layer_id) != self.layer_shard_rank:
+            return
+        cp_group = get_parallel().attn_cp_group
+        group = get_layer_split_p2p_group()
+        for peer_rank, peer_global in enumerate(cp_group.ranks):
+            if peer_rank == self.layer_shard_rank:
+                continue
+            for src, _dst in self._transfer_layer_p2p_pairs(layer_id, used_bound):
+                self._transfer_send_works.append(
+                    torch.distributed.isend(src, dst=peer_global, group=group)
+                )
+
+    def layer_transfer_wait_sends(self) -> None:
+        """Drain the outstanding owner sends (one chunk of pipelining)."""
+        if not self._transfer_send_works:
+            return
+        for work in self._transfer_send_works:
+            work.wait()
+        self._transfer_send_works = []
 
     def _broadcast_kv_from_owner(self, layer_id: int, used_bound: Optional[int] = None):
         """Broadcast K and V token rows [0, slice_tokens) from the owner."""

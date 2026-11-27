@@ -4571,16 +4571,6 @@ class HybridLinearKVPool(KVCache):
                 return []
             entry_dense_ids = list(self.full_kv_pool.get_kv_layer_ids())
             entry_ids = [layer_ids[i] for i in entry_dense_ids]
-            logger.info(
-                "[split-debug] hybrid get_kv_layer_ids: entries=%d ids=%d "
-                "full_attn_layers=%d shard=%s dense_head=%s ids_head=%s",
-                len(data_ptrs),
-                len(entry_ids),
-                len(layer_ids),
-                getattr(self.full_kv_pool, "layer_shard_enabled", False),
-                entry_dense_ids[:9],
-                entry_ids[:9],
-            )
             return entry_ids
         return layer_ids if self.use_mla else layer_ids * 2
 

@@ -262,20 +262,6 @@ class AscendKVManager(MooncakeKVManager):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
         )
-        # TEMP DEBUG (layer-split accuracy): log at method entry to reveal
-        # which gate term evaluates False when the generic path is skipped.
-        logger.info(
-            "[split-debug] send_kvcache enter: hybrid=%s pp=%d flag=%s "
-            "shard=%s src_ids=%s n_src_ids=%s dst_ids=%s n_dst_ids=%s",
-            self.is_hybrid_mla_backend,
-            self.pp_size,
-            get_parallel().enable_dsa_cache_layer_split,
-            getattr(self.kv_args, "layer_shard_enabled", None),
-            bool(self.kv_args.kv_layer_ids),
-            (len(self.kv_args.kv_layer_ids) if self.kv_args.kv_layer_ids else 0),
-            bool(dst_layer_ids),
-            (len(dst_layer_ids) if dst_layer_ids else 0),
-        )
         # Hybrid MLA prefill stages expose PP-local entries, while a PP=1
         # decode peer registers all model layers. Pair only this layout by
         # global layer id; every other Ascend layout keeps the legacy path.
@@ -293,24 +279,6 @@ class AscendKVManager(MooncakeKVManager):
                 and len(self.kv_args.kv_layer_ids) != len(dst_layer_ids)
             )
         ):
-            # TEMP DEBUG (layer-split accuracy): dump the pairing inputs once
-            # per transfer so the id pairing can be verified at runtime.
-            logger.info(
-                "[split-debug] send_kvcache generic: src_entries=%d dst_entries=%d "
-                "src_ids=%s dst_ids=%s src_ids_head=%s dst_ids_head=%s "
-                "item_lens=%s n_src_idx=%d n_dst_idx=%d pp=%d dcp=%d",
-                len(self.kv_args.kv_data_ptrs),
-                len(dst_kv_ptrs),
-                bool(self.kv_args.kv_layer_ids),
-                bool(dst_layer_ids),
-                list(self.kv_args.kv_layer_ids or [])[:12],
-                list(dst_layer_ids or [])[:12],
-                list(self.kv_args.kv_item_lens)[:6],
-                len(prefill_kv_indices),
-                len(dst_kv_indices),
-                self.pp_size,
-                getattr(self.kv_args, "dcp_size", 1) or 1,
-            )
             return self._send_kvcache_generic(
                 mooncake_session_id=mooncake_session_id,
                 item_lens=self.kv_args.kv_item_lens,
@@ -442,22 +410,6 @@ class AscendKVManager(MooncakeKVManager):
         draft_rows_collapsed: bool = False,
         dsa_index_k: Optional[_DcpIndexK] = None,
     ) -> int:
-        # TEMP DEBUG (layer-split accuracy): confirm whether transfers take
-        # the DCP relayout path instead of send_kvcache.
-        logger.info(
-            "[split-debug] send_kvcache_dcp: n_src_idx=%d n_dst_idx=%d "
-            "dst_dcp=%d dst_dcp_rank=%d src_page_offset=%d num_kv_tokens=%d "
-            "src_ids=%s dst_ids=%s item_lens=%s",
-            len(prefill_kv_indices),
-            len(dst_kv_indices),
-            dst_dcp_size,
-            dst_dcp_rank,
-            src_page_offset,
-            num_kv_tokens,
-            bool(self.kv_args.kv_layer_ids),
-            bool(dst_layer_ids),
-            list(self.kv_args.kv_item_lens)[:6],
-        )
         if not self._uses_page_interleaved_dcp():
             return super().send_kvcache_dcp(
                 mooncake_session_id,
