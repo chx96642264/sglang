@@ -735,11 +735,30 @@ class ModelSlimConfig(QuantizationConfig):
         # A single part equal to the whole name is the same entry, not a conflict.
         if any(present):
             if whole_quant_prefix is not None and components != [whole_quant_prefix]:
-                raise ValueError(
-                    f"Ambiguous ModelSlim layout for {prefix}: whole tensor "
-                    f"{whole_quant_prefix}.weight and component tensors "
-                    f"{[p + '.weight' for p in components]} are both described"
-                )
+                if len(components) == 1:
+                    # A single-component mapping renames the layer (e.g.
+                    # GLM-5.3-Flash f_a_proj <- forget_gate.f_a_proj). The
+                    # quantizer may describe both spellings; accept them as
+                    # one weight when the schemes agree.
+                    whole_scheme = self.quant_description[
+                        whole_quant_prefix + ".weight"
+                    ]
+                    component_scheme = self.quant_description[
+                        components[0] + ".weight"
+                    ]
+                    if whole_scheme != component_scheme:
+                        raise ValueError(
+                            f"Ambiguous ModelSlim layout for {prefix}: whole tensor "
+                            f"{whole_quant_prefix}.weight ({whole_scheme}) and component "
+                            f"tensor {components[0]}.weight ({component_scheme}) are "
+                            f"both described with different schemes"
+                        )
+                else:
+                    raise ValueError(
+                        f"Ambiguous ModelSlim layout for {prefix}: whole tensor "
+                        f"{whole_quant_prefix}.weight and component tensors "
+                        f"{[p + '.weight' for p in components]} are both described"
+                    )
             return components
         if whole_quant_prefix is not None:
             return [whole_quant_prefix]

@@ -1567,7 +1567,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 # An entry elided on either side moves no bytes and has no
                 # registered buffer to write into.
-                return [
+                # TEMP DEBUG (layer-split accuracy): dump the actual pairs.
+                paired = [
                     (i, j, item_lens[i])
                     for i, j in pairs
                     if not is_elided_entry(
@@ -1577,6 +1578,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         allow_dst_elision=state_type == StateType.DSA,
                     )
                 ]
+                logger.info(
+                    "[split-debug] generic pairs: state=%s force_flat=%s "
+                    "src_ids=%s src_lens=%s dst_n=%d dst_lens=%s pairs(src,dst,len)=%s",
+                    state_type,
+                    force_flat,
+                    list(src_layer_ids or []),
+                    list(item_lens)[:6],
+                    num_dst_entries,
+                    (list(dst_item_lens)[:6] if dst_item_lens else None),
+                    paired[:8],
+                )
+                return paired
             src_layers, dst_layers, layers_current_pp_stage = (
                 self.get_mla_kv_ptrs_with_pp(src_entries, dst_entries, state_type)
             )
@@ -2807,6 +2820,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_indices = (
                 req.dst_state_indices[i] if i < len(req.dst_state_indices) else []
             )
+            # TEMP DEBUG (layer-split accuracy): dump one line per state
+            # component (MAMBA does not go through _generic_entry_pairs, so it
+            # never shows up in that grep).
+            logger.info(
+                "[split-debug] extra state=%s n_src_keys=%d n_dst_keys=%d "
+                "src_lens=%s dst_lens=%s src_lids=%s dst_lids=%s n_idx=%s",
+                getattr(st, "name", st),
+                len(src_keys),
+                len(dst_keys),
+                list(src_item_lens)[:6],
+                (list(dst_item_lens)[:6] if dst_item_lens else None),
+                list(src_state_layer_ids)[:6],
+                (list(dst_state_layer_ids)[:6] if dst_state_layer_ids else None),
+                [len(x) if x is not None else None for x in ([indices, dst_indices])],
+            )
 
             if st == StateType.MAMBA:
                 if (not src_dim_per_tensor or not dst_dim_per_tensor) and list(
@@ -3532,6 +3560,47 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
+                        # TEMP DEBUG (layer-split accuracy): dump the dispatch
+                        # branch selection once per chunk transfer.
+                        logger.info(
+                            "[split-debug] dispatch: is_dcp=%s skip_kv=%s "
+                            "skip_state=%s mla=%s hybrid=%s n_src_idx=%d "
+                            "n_dst_idx=%d prefill_dcp=%d dst_dcp=%d dst_tp=%d "
+                            "state_types=%s src_kv_item_lens=%s "
+                            "dst_kv_item_lens=%s dst_state_item_lens=%s "
+                            "group_sharing=%s",
+                            is_dcp_transfer,
+                            skip_kv,
+                            skip_state,
+                            self.is_mla_backend,
+                            self.is_hybrid_mla_backend,
+                            len(kv_chunk.prefill_kv_indices),
+                            len(chunked_dst_kv_indice),
+                            self.dcp_size,
+                            target_rank_registration_info.dst_dcp_size,
+                            target_rank_registration_info.dst_attn_tp_size,
+                            [
+                                getattr(st, "name", st)
+                                for st in getattr(self.kv_args, "state_types", []) or []
+                            ],
+                            list(self.kv_args.kv_item_lens)[:8],
+                            (
+                                list(target_rank_registration_info.dst_kv_item_lens)[:8]
+                                if target_rank_registration_info.dst_kv_item_lens
+                                else None
+                            ),
+                            (
+                                [
+                                    list(x)[:4]
+                                    for x in target_rank_registration_info.dst_state_item_lens[
+                                        :3
+                                    ]
+                                ]
+                                if target_rank_registration_info.dst_state_item_lens
+                                else None
+                            ),
+                            get_parallel().enable_cp_tp_group_sharing,
+                        )
                         if (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
@@ -3672,9 +3741,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         if kv_chunk.is_last_chunk:
                             is_request_peer = (
                                 not self.kv_shard_state_peer_only
-                                or self._is_request_peer(
-                                    target_rank_registration_info.dst_tp_rank
-                                )
+                                and not self.layer_split_state_peer_only
+                            ) or self._is_request_peer(
+                                target_rank_registration_info.dst_tp_rank
                             )
                             if (
                                 kv_chunk.state_indices

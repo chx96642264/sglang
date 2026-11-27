@@ -514,6 +514,16 @@ class CommonKVManager(BaseKVManager):
             and cp_tp_group_sharing
             and StateType.QSA_COMPRESSED in args.state_types
         )
+        # DSA cache layer split under CP-TP group sharing fans the owner-
+        # scattered KV in like the sharding path, but the GDN head shards (and
+        # the aux) must still reach only the paired decode rank: the owners
+        # hold disjoint head shards, so a fan-in write would let 16 shards
+        # race for one decode slot.
+        self.layer_split_state_peer_only = (
+            get_parallel().enable_dsa_cache_layer_split
+            and cp_tp_group_sharing
+            and self.attn_tp_size > 1
+        )
 
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
@@ -1756,6 +1766,22 @@ class CommonKVManager(BaseKVManager):
                 "KV cache sharding requires equal prefill/decode attn TP "
                 f"sizes, got prefill={info.attn_tp_size} decode={self.attn_tp_size}"
             )
+            target_tp_rank = None
+            target_tp_ranks = list(range(info.attn_tp_size))
+            required_dst_info_num = self.attn_tp_size
+            required_prefill_response_num = info.attn_tp_size
+        elif (
+            self.attn_tp_size == info.attn_tp_size
+            and info.enable_dsa_cache_layer_split
+            and info.attn_tp_size > 1
+        ):
+            # DSA cache layer split scatters the layer owners over the prefill
+            # TP group. Under CP-TP group sharing the CP group IS the TP group
+            # and registers as attn_tp with attn_cp masked to 1, so a 1:1 TP
+            # pairing would leave each decode rank with only one owner's
+            # layers. Fan in over every owner, like the KV-sharding branch
+            # above. (A TP-1 layer-split prefill fans in over its CP ranks in
+            # the CP mapping below instead.)
             target_tp_rank = None
             target_tp_ranks = list(range(info.attn_tp_size))
             required_dst_info_num = self.attn_tp_size

@@ -1966,6 +1966,36 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
             def _dsa_tail_payload():
+                pool = self.token_to_kv_pool_allocator.get_kvcache()
+                if getattr(pool, "use_dsa", False):
+                    pool = pool.full_kv_pool
+                # TEMP DEBUG (layer-split gate): dump owned vs non-owned tail
+                # abs-sum per layer. shape[0]==0 entries are skip_topk layers
+                # (reported as -1.0); all-zero rows on non-owned layers are
+                # the expected root-cause signature. Judge only n_valid>0.
+                if getattr(pool, "layer_shard_enabled", False) and getattr(
+                    pool, "_compress_tail_k", None
+                ) is not None:
+                    req_row = int(req.kv.req_pool_idx)
+                    n_valid = int(seq_len) % int(pool.index_kpool)
+                    owned_start, owned_end = pool._owned_local_layer_range()
+                    sums = [
+                        float(t[req_row].float().abs().sum().item())
+                        if t.shape[0] > 0
+                        else -1.0
+                        for t in pool._compress_tail_k
+                    ]
+                    logger.info(
+                        "[split-gate] rank=%d req_row=%d seq_len=%d n_valid=%d "
+                        "owned=[%d,%d) k_abs_sum=%s",
+                        get_parallel().attn_cp_rank,
+                        req_row,
+                        int(seq_len),
+                        n_valid,
+                        owned_start,
+                        owned_end,
+                        ["%.1f" % s for s in sums],
+                    )
                 return get_dsa_tail_state_indices(
                     self.token_to_kv_pool_allocator.get_kvcache(),
                     req.kv.req_pool_idx,
