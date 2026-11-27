@@ -386,7 +386,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
             if self.pending_remote_index_layer_id == layer_id:
                 return
             self._finalize_pending_index_broadcast(
-                set_remote_layer_id=False, wait_works=False
+                set_remote_layer_id=False, wait_works=True
             )
         # Same assign-not-max as the KV bound: row-space, per-chunk correct.
         self._idx_used_bound = used_bound or 0
@@ -443,7 +443,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
             if self.pending_remote_kv_layer_id == layer_id:
                 return
             self._finalize_pending_kv_broadcast(
-                set_remote_layer_id=False, wait_works=False
+                set_remote_layer_id=False, wait_works=True
             )
 
         if layer_transfer_counter is not None and layer_transfer_idx is not None:
@@ -472,7 +472,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         """Materialize ``layer_id``'s indexer rows on every rank (paired broadcast)."""
         if self.pending_remote_index_broadcast:
             self._finalize_pending_index_broadcast(
-                set_remote_layer_id=False, wait_works=False
+                set_remote_layer_id=False, wait_works=True
             )
         if self.remote_index_layer_id == layer_id:
             return
