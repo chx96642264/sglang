@@ -27,6 +27,9 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.dsa.utils import (
+    maybe_prefetch_next_full_attention_kv,
+)
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -1038,6 +1041,7 @@ class Glm5NextDecoderLayer(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
         capture_output=None,
+        next_full_attention_layer_id: Optional[int] = None,
     ):
         hidden_states_orig = residual_access.buffer(hidden_states)
 
@@ -1066,6 +1070,10 @@ class Glm5NextDecoderLayer(nn.Module):
                 prev_topk_indices=prev_topk_indices,
             )
         get_attn_tp_context().clear_attn_inputs()
+
+        maybe_prefetch_next_full_attention_kv(
+            forward_batch, next_full_attention_layer_id
+        )
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
@@ -1202,6 +1210,17 @@ class Glm5NextModel(nn.Module):
             prefix=add_prefix("layers", prefix),
             stage_facts=lambda idx: Glm5NextDecoderLayer.stage_facts(config, idx),
         )
+        # Layer-split prefetch: for each local layer, the next full-attention
+        # (DSA) layer id in the global index space, skipping KDA layers so the
+        # one-layer-ahead owner broadcast overlaps the current layer's compute.
+        local_layer_ids = list(range(self.start_layer, self.end_layer))
+        next_full_attn_map: dict = {}
+        for idx, gid in enumerate(local_layer_ids):
+            for nxt in local_layer_ids[idx + 1 :]:
+                if not config.is_kda_layer(nxt):
+                    next_full_attn_map[gid] = nxt
+                    break
+        self.next_full_attention_layer_id = next_full_attn_map
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -1357,6 +1376,9 @@ class Glm5NextModel(nn.Module):
                     capture_output=capture_output
                     if i in self.layers_to_capture
                     else None,
+                    next_full_attention_layer_id=self.next_full_attention_layer_id.get(
+                        i
+                    ),
                 )
 
         if normal_end_layer != self.end_layer:
