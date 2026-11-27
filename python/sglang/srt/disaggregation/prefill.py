@@ -706,6 +706,107 @@ class PrefillBootstrapQueue:
             self.kv_manager.register_buffer_to_engine()
 
 
+def _split_check_abs_sum(tensor) -> float:
+    """TEMP DEBUG (split-check): float32 abs-sum of one tensor."""
+    return float(tensor.float().abs().sum().item())
+
+
+def _split_check_prefill_states(scheduler, req, seq_len: int) -> None:
+    """TEMP DEBUG (split-check): per-request checksums of the decode inputs
+    the [split-gate] tail dump does not cover (mamba state rows, owned-layer
+    indexer K, aux metadata source fields). Logging only; every probe is
+    best-effort and must never break the send."""
+    room = req.bootstrap_room if req.bootstrap_room is not None else -1
+    rank = get_parallel().attn_cp_rank
+    req_row = int(req.kv.req_pool_idx)
+
+    # (a) MAMBA state rows of this request, one sum per transfer entry
+    # (group x layer), addressing the same row the state payload sends.
+    try:
+        alloc = scheduler.token_to_kv_pool_allocator
+        mamba_pool = getattr(alloc.get_kvcache(), "mamba_pool", None)
+        mapping = getattr(
+            scheduler.req_to_token_pool, "req_index_to_mamba_index_mapping", None
+        )
+        if mamba_pool is not None and mapping is not None:
+            slot_t = mapping[req_row]
+            row = int(
+                alloc.state_ids(scheduler.req_to_token_pool.state_sub_pool)
+                .ids(slot_t)
+                .item()
+            )
+            sums = []
+            for field, layer_view, _axis, layer_id in (
+                mamba_pool._iter_transfer_state_entries()
+            ):
+                if layer_view.shape[0] <= row:
+                    continue
+                sums.append(
+                    "%s%s=%.1f"
+                    % (field, layer_id, _split_check_abs_sum(layer_view[row]))
+                )
+            logger.info(
+                "[split-check] P mamba room=%d rank=%d req_row=%d slot=%d sums=%s",
+                room,
+                rank,
+                req_row,
+                row,
+                sums,
+            )
+    except Exception as e:  # noqa: BLE001 - debug probe must never break the send
+        logger.info("[split-check] P mamba room=%d ERROR %s", room, repr(e))
+
+    # (b) Indexer K rows of this request's pages, owned layers only: read the
+    # local index_k_buffer directly, never a broadcast read of another rank's
+    # layer. Silently skipped without a layer-split pool.
+    try:
+        pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
+        if getattr(pool, "use_dsa", False):
+            pool = pool.full_kv_pool
+        index_k_buffer = getattr(pool, "index_k_buffer", None)
+        if index_k_buffer is not None and getattr(pool, "layer_shard_enabled", False):
+            owned_start, owned_end = pool._owned_local_layer_range()
+            kv_idx = scheduler.req_to_token_pool.req_to_token[req_row, :seq_len].long()
+            sums = []
+            for slot in pool.indexer_layer_id_to_slot.values():
+                flat = index_k_buffer[slot].reshape(-1, index_k_buffer.shape[-1])
+                local_idx = kv_idx[kv_idx < flat.shape[0]]
+                if local_idx.numel() == 0:
+                    sums.append("-1.0")
+                else:
+                    sums.append("%.1f" % _split_check_abs_sum(flat[local_idx]))
+            logger.info(
+                "[split-check] P idxk room=%d rank=%d owned=[%d,%d) sums=%s",
+                room,
+                rank,
+                owned_start,
+                owned_end,
+                sums,
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.info("[split-check] P idxk room=%d ERROR %s", room, repr(e))
+
+    # (c) Aux/metadata source fields this rank would hand to its peer D rank.
+    try:
+        out_ids = getattr(req, "output_ids", None)
+        if out_ids is None:
+            out_ids_head = None
+        elif hasattr(out_ids, "tolist"):
+            out_ids_head = out_ids[:8].tolist()
+        else:
+            out_ids_head = list(out_ids[:8])
+        logprobs = getattr(req, "logprobs", None)
+        logger.info(
+            "[split-check] P aux room=%d rank=%d out_ids=%s len(logprobs)=%s",
+            room,
+            rank,
+            out_ids_head,
+            len(logprobs) if logprobs is not None else None,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.info("[split-check] P aux room=%d ERROR %s", room, repr(e))
+
+
 class SchedulerDisaggregationPrefillMixin:
     """
     Mixin for Scheduler to handle disaggregation prefill
@@ -2071,6 +2172,10 @@ class SchedulerDisaggregationPrefillMixin:
                         prefix_len=req.disagg_decode_prefix_len,
                     )
                 )
+            # TEMP DEBUG (split-check): checksum probes for the non-KV decode
+            # inputs (mamba state, owned-layer indexer K, aux fields), once per
+            # request on the final chunk. Logging only, best-effort.
+            _split_check_prefill_states(self, req, seq_len)
             state_indices = state_indices_per_entry(
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args,
                 state_types,

@@ -3319,6 +3319,110 @@ def _generate_fake_prefill_handoff_output_id(req: Req) -> int:
     return int.from_bytes(digest, byteorder="little") % req.vocab_size
 
 
+def _split_check_abs_sum(tensor) -> float:
+    """TEMP DEBUG (split-check): float32 abs-sum of one tensor."""
+    return float(tensor.float().abs().sum().item())
+
+
+def _split_check_decode_states(recv_queue, decode_req, seq_len: int) -> None:
+    """TEMP DEBUG (split-check): per-request checksums of the decode inputs the
+    [kv-gate] dump does not cover (mamba state rows, DSA tail rows, indexer K
+    rows). Logging only; every probe is best-effort and must never break the
+    commit. Run once per request, next to the kv-gate dump."""
+    req = decode_req.req
+    room = req.bootstrap_room if req.bootstrap_room is not None else -1
+    rank = recv_queue.tp_rank
+    req_row = int(req.kv.req_pool_idx)
+    alloc = recv_queue.tree_cache.token_to_kv_pool_allocator
+    pool = alloc.get_kvcache()
+    if getattr(pool, "use_dsa", False):
+        pool = pool.full_kv_pool
+
+    # (d) MAMBA state rows of this request's local slot, one sum per transfer
+    # entry (group x layer), addressing the row the received state lands in.
+    try:
+        mamba_pool = getattr(alloc.get_kvcache(), "mamba_pool", None)
+        mapping = getattr(
+            recv_queue.tree_cache.req_to_token_pool,
+            "req_index_to_mamba_index_mapping",
+            None,
+        )
+        if mamba_pool is not None and mapping is not None:
+            slot_t = mapping[req_row]
+            row = int(
+                alloc.state_ids(
+                    recv_queue.tree_cache.req_to_token_pool.state_sub_pool
+                )
+                .ids(slot_t)
+                .item()
+            )
+            sums = []
+            for field, layer_view, _axis, layer_id in (
+                mamba_pool._iter_transfer_state_entries()
+            ):
+                if layer_view.shape[0] <= row:
+                    continue
+                sums.append(
+                    "%s%s=%.1f"
+                    % (field, layer_id, _split_check_abs_sum(layer_view[row]))
+                )
+            logger.info(
+                "[split-check] D mamba room=%d rank=%d req_row=%d slot=%d sums=%s",
+                room,
+                rank,
+                req_row,
+                row,
+                sums,
+            )
+    except Exception as e:  # noqa: BLE001 - debug probe must never break commit
+        logger.info("[split-check] D mamba room=%d ERROR %s", room, repr(e))
+
+    # (e) DSA_TAIL rows of this request, per layer (same view as the P-side
+    # [split-gate] dump; shape[0]==0 entries are skip_topk layers).
+    try:
+        tails = getattr(pool, "_compress_tail_k", None)
+        if tails is not None:
+            n_valid = seq_len % int(pool.index_kpool)
+            sums = [
+                "%.1f" % _split_check_abs_sum(t[req_row]) if t.shape[0] > 0 else "-1.0"
+                for t in tails
+            ]
+            logger.info(
+                "[split-check] D tail room=%d rank=%d n_valid=%d sums=%s",
+                room,
+                rank,
+                n_valid,
+                sums,
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.info("[split-check] D tail room=%d ERROR %s", room, repr(e))
+
+    # (f) Indexer K rows of this request's pages; D holds all indexer layers
+    # locally (no layer split on decode).
+    try:
+        index_k_buffer = getattr(pool, "index_k_buffer", None)
+        if index_k_buffer is not None:
+            kv_idx = recv_queue.tree_cache.req_to_token_pool.req_to_token[
+                req_row, :seq_len
+            ].long()
+            sums = []
+            for slot in range(index_k_buffer.shape[0]):
+                flat = index_k_buffer[slot].reshape(-1, index_k_buffer.shape[-1])
+                local_idx = kv_idx[kv_idx < flat.shape[0]]
+                if local_idx.numel() == 0:
+                    sums.append("-1.0")
+                else:
+                    sums.append("%.1f" % _split_check_abs_sum(flat[local_idx]))
+            logger.info(
+                "[split-check] D idxk room=%d rank=%d sums=%s",
+                room,
+                rank,
+                sums,
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.info("[split-check] D idxk room=%d ERROR %s", room, repr(e))
+
+
 class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
     Store the requests that is polling kv
@@ -3458,6 +3562,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         except Exception as e:  # noqa: BLE001 - debug dump must never break commit
             logger.warning("[kv-gate] dump failed: %r", e)
 
+        # TEMP DEBUG (split-check): checksum probes for the non-KV decode
+        # inputs (mamba state, DSA tail, indexer K), once per request after
+        # the transfer completes. Logging only, best-effort.
+        _split_check_decode_states(
+            self, decode_req, len(decode_req.req.origin_input_ids)
+        )
+
         # Keep the checksum before the metadata slot is freed; it is verified
         # when the request enters a batch.
         idx = decode_req.metadata_buffer_index
@@ -3490,6 +3601,25 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if decode_req.req.bootstrap_room is not None
             else 0
         )
+
+        # TEMP DEBUG (split-check): what this metadata slot actually holds,
+        # next to the existing bootstrap_room validation.
+        try:
+            logger.info(
+                "[split-check] D meta room=%d rank=%d meta_idx=%d stored_room=%s",
+                decode_req.req.bootstrap_room
+                if decode_req.req.bootstrap_room is not None
+                else -1,
+                self.tp_rank,
+                idx,
+                int(actual_room),
+            )
+        except Exception as e:  # noqa: BLE001 - debug probe must never break commit
+            logger.info(
+                "[split-check] D meta room=%s ERROR %r",
+                decode_req.req.bootstrap_room,
+                e,
+            )
 
         if _is_fake_transfer(decode_req.req):
             pass
