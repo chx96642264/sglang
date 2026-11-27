@@ -4314,6 +4314,10 @@ class HybridLinearKVPool(KVCache):
         host_to_device_ratio: Optional[int] = None,
         use_fp4_indexer: bool = False,
         use_combined_kv_buffer: bool = False,
+        # NPU DSA cache layer-split: forwarded to a
+        # LayerSplitNPUMLATokenToKVPool full pool (active when size > 1).
+        layer_shard_rank: int = -1,
+        layer_shard_size: int = -1,
     ):
         self.size = size
         self.dtype = dtype
@@ -4374,6 +4378,14 @@ class HybridLinearKVPool(KVCache):
                 if host_to_device_ratio is None
                 else {"host_to_device_ratio": host_to_device_ratio}
             )
+            layer_shard_kwargs = (
+                {}
+                if layer_shard_size < 0
+                else {
+                    "layer_shard_rank": layer_shard_rank,
+                    "layer_shard_size": layer_shard_size,
+                }
+            )
             self.full_kv_pool = DSAPoolClass(
                 size=size,
                 page_size=self.page_size,
@@ -4393,6 +4405,7 @@ class HybridLinearKVPool(KVCache):
                 kv_scale_ue8m0=kv_scale_ue8m0,
                 fp8_cast_on_write=fp8_cast_on_write,
                 **hisparse_kwargs,
+                **layer_shard_kwargs,
                 use_fp4_indexer=use_fp4_indexer,
             )
         else:
@@ -4481,6 +4494,46 @@ class HybridLinearKVPool(KVCache):
     def index_page_size(self) -> int:
         return getattr(self.full_kv_pool, "index_page_size", self.page_size)
 
+    # -- NPU DSA cache layer-split delegation: PD transfer and the NPU
+    # attention backend read these off `token_to_kv_pool`, which is this
+    # wrapper for hybrid models, while the shard state lives on the
+    # full-attention sub-pool.
+
+    @property
+    def layer_shard_enabled(self) -> bool:
+        return getattr(self.full_kv_pool, "layer_shard_enabled", False)
+
+    @property
+    def layer_shard_rank(self) -> Optional[int]:
+        return getattr(self.full_kv_pool, "layer_shard_rank", None)
+
+    @property
+    def layer_shard_size(self) -> int:
+        return getattr(self.full_kv_pool, "layer_shard_size", 1)
+
+    @property
+    def layer_shard_start(self) -> Optional[int]:
+        return getattr(self.full_kv_pool, "layer_shard_start", self.start_layer)
+
+    def get_kv_transfer_layer_span(self, num_entries: int) -> int:
+        return self.full_kv_pool.get_kv_transfer_layer_span(num_entries)
+
+    # Layer-split prefetch: the DSA layer forward kicks the next layer's
+    # owner-broadcast through `get_token_to_kv_pool()` (this wrapper for
+    # hybrid models), while the broadcast state lives on the sub-pool keyed
+    # by dense layer ids. No-op unless the split pool is active, mirroring
+    # the getattr-based kick in maybe_prefetch_next_full_attention_kv.
+
+    def prefetch_kv_buffer(self, layer_id: int, **kwargs) -> None:
+        prefetch = getattr(self.full_kv_pool, "prefetch_kv_buffer", None)
+        if prefetch is not None:
+            prefetch(self._transfer_full_attention_id(layer_id), **kwargs)
+
+    def prefetch_index_k_buffer(self, layer_id: int, **kwargs) -> None:
+        prefetch = getattr(self.full_kv_pool, "prefetch_index_k_buffer", None)
+        if prefetch is not None:
+            prefetch(self._transfer_full_attention_id(layer_id), **kwargs)
+
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
 
@@ -4501,8 +4554,34 @@ class HybridLinearKVPool(KVCache):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
         if self.use_mla and _is_npu and layer_ids:
+            # Per-entry dense->global mapping (Kimi PR #53323): the backing
+            # pool reports one dense full-attention id per buffer entry, so
+            # elided groups (skip_topk index rows, packed c8 stores) and
+            # owned-only CP shards stay aligned. Every id is mapped back to
+            # its global model layer id — the PD pairing contract pairs
+            # entries by global model layer id. The old
+            # `layer_ids * (len(data_ptrs) // len(layer_ids))` repetition
+            # silently mispaired whenever the entry count was not a uniform
+            # multiple of the layer count. The result can be empty:
+            # attn_cp_size may exceed the full-attention layer count,
+            # leaving some CP ranks with no owned layer (they transfer no
+            # full-attention KV entries).
             data_ptrs, _, _ = self.get_contiguous_buf_infos()
-            return layer_ids * (len(data_ptrs) // len(layer_ids))
+            if not data_ptrs:
+                return []
+            entry_dense_ids = list(self.full_kv_pool.get_kv_layer_ids())
+            entry_ids = [layer_ids[i] for i in entry_dense_ids]
+            logger.info(
+                "[split-debug] hybrid get_kv_layer_ids: entries=%d ids=%d "
+                "full_attn_layers=%d shard=%s dense_head=%s ids_head=%s",
+                len(data_ptrs),
+                len(entry_ids),
+                len(layer_ids),
+                getattr(self.full_kv_pool, "layer_shard_enabled", False),
+                entry_dense_ids[:9],
+                entry_ids[:9],
+            )
+            return entry_ids
         return layer_ids if self.use_mla else layer_ids * 2
 
     def get_state_buf_infos(self):
@@ -4659,6 +4738,8 @@ class HybridLinearKVPool(KVCache):
         k_scale: float = 1.0,
         v_scale: float = 1.0,
         dcp_kv_mask: Optional[torch.Tensor] = None,
+        cp_gathered_full: bool = False,
+        cp_gathered_chunk: bool = False,
     ):
         # Write-location info lives in the metadata (`KVWriteLoc`). `full_loc` is the
         # unified pool's pre-translated PHYSICAL loc (None for a static pool, where
@@ -4683,12 +4764,24 @@ class HybridLinearKVPool(KVCache):
         else:
             # MLA pools whose set_kv_buffer takes no layer_id_override (the
             # FP4 and NPU ones) address the layer by `layer.layer_id`.
+            # The NPU layer-split pool additionally takes the CP-gather flags
+            # its prefill-CP write path needs; only forwarded when active so
+            # the base NPU MLA pool (which takes none) stays untouched.
+            split_kwargs = (
+                {
+                    "cp_gathered_full": cp_gathered_full,
+                    "cp_gathered_chunk": cp_gathered_chunk,
+                }
+                if getattr(self.full_kv_pool, "layer_shard_enabled", False)
+                else {}
+            )
             with self._transfer_id_context(layer):
                 self.full_kv_pool.set_kv_buffer(
                     layer,
                     write_loc,
                     cache_k,
                     cache_v,
+                    **split_kwargs,
                 )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):

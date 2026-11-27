@@ -261,16 +261,31 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         src = cp_group.ranks[owner_rank]
         if self.layer_shard_rank == owner_rank:
             k_buf = self.k_buffer[offset].view(-1, self.kv_cache_dim)[:slice_tokens]
-            v_buf = self.v_buffer[offset].view(-1, self.kr_cache_dim)[:slice_tokens]
+            v_buf = (
+                self.v_buffer[offset].view(-1, self.kr_cache_dim)[:slice_tokens]
+                if self.kr_cache_dim
+                # Nope-only MLA (e.g. GLM-5.3-Flash: qk_rope_head_dim == 0):
+                # the V/rope tail is zero-width, so there is nothing to
+                # broadcast; the finalize path already skips None handles.
+                else None
+            )
         else:
             k_buf = self.remote_k_buffer.view(-1, self.kv_cache_dim)[:slice_tokens]
-            v_buf = self.remote_v_buffer.view(-1, self.kr_cache_dim)[:slice_tokens]
+            v_buf = (
+                self.remote_v_buffer.view(-1, self.kr_cache_dim)[:slice_tokens]
+                if self.kr_cache_dim
+                else None
+            )
         return [
             torch.distributed.broadcast(
                 k_buf, src=src, group=cp_group.device_group, async_op=True
             ),
-            torch.distributed.broadcast(
-                v_buf, src=src, group=cp_group.device_group, async_op=True
+            (
+                torch.distributed.broadcast(
+                    v_buf, src=src, group=cp_group.device_group, async_op=True
+                )
+                if v_buf is not None
+                else None
             ),
         ]
 
@@ -431,9 +446,12 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         if self.remote_kv_layer_id == layer_id:
             return
         # Fallback materialization: wait immediately, the caller reads the
-        # scratch right after this returns.
+        # scratch right after this returns. Zero-width handles (nope-only
+        # MLA) come back as None and are skipped, matching
+        # _finalize_pending_kv_broadcast.
         for _w in self._broadcast_kv_from_owner(layer_id, None):
-            _w.wait()
+            if _w is not None:
+                _w.wait()
         self.remote_kv_layer_id = layer_id
 
     def _ensure_remote_index_layer(self, layer_id: int) -> None:
@@ -576,11 +594,15 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                 loc.view(-1, 1),
                 cache_k.view(-1, 1, self.kv_lora_rank),
             )
-            torch_npu.npu_scatter_nd_update_(
-                self.remote_v_buffer.view(-1, 1, self.qk_rope_head_dim),
-                loc.view(-1, 1),
-                cache_v.view(-1, 1, self.qk_rope_head_dim),
-            )
+            # Nope-only MLA: the zero-width V/rope tail has no scatter
+            # target (view(-1, 1, 0) is ambiguous); the K rows carry all
+            # the data.
+            if self.kr_cache_dim:
+                torch_npu.npu_scatter_nd_update_(
+                    self.remote_v_buffer.view(-1, 1, self.qk_rope_head_dim),
+                    loc.view(-1, 1),
+                    cache_v.view(-1, 1, self.qk_rope_head_dim),
+                )
         self.remote_kv_layer_id = layer.layer_id
 
     def set_index_k_buffer(

@@ -105,6 +105,9 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _use_aiter_gfx95,
 )
+from sglang.srt.layers.attention.dsa.utils import (
+    maybe_prefetch_next_hybrid_full_attention_kv,
+)
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Glm5NextMLP
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE as Glm5NextMoE
@@ -783,6 +786,7 @@ class Glm5NextDecoderLayer(nn.Module):
         self.layer_id = layer_id
         self.is_nextn = is_nextn
         self.is_linear_attn = config.is_kda_layer(layer_id)
+        self.next_full_attention_layer_id = None
 
         if self.is_linear_attn:
             self.self_attn = Glm5NextLinearAttention(
@@ -1067,6 +1071,10 @@ class Glm5NextDecoderLayer(nn.Module):
             )
         get_attn_tp_context().clear_attn_inputs()
 
+        maybe_prefetch_next_hybrid_full_attention_kv(
+            forward_batch, self.next_full_attention_layer_id
+        )
+
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
@@ -1202,6 +1210,19 @@ class Glm5NextModel(nn.Module):
             prefix=add_prefix("layers", prefix),
             stage_facts=lambda idx: Glm5NextDecoderLayer.stage_facts(config, idx),
         )
+        # One-layer-ahead owner-broadcast prefetch under prefill-CP layer
+        # split: each local Full Attention layer kicks its successor, and a
+        # leading KDA layer kicks the first local Full Attention layer.
+        local_full_layers = [
+            i
+            for i in config.full_attention_layer_ids
+            if self.start_layer <= i < self.end_layer
+        ]
+        for layer_id, next_layer_id in zip(local_full_layers, local_full_layers[1:]):
+            self.layers[layer_id].next_full_attention_layer_id = next_layer_id
+        if local_full_layers and self.start_layer < local_full_layers[0]:
+            first_layer = self.layers[self.start_layer]
+            first_layer.next_full_attention_layer_id = local_full_layers[0]
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
