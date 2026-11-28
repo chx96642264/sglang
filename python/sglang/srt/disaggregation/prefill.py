@@ -2008,6 +2008,46 @@ class SchedulerDisaggregationPrefillMixin:
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
+            # TEMP DEBUG: source-side digest of the rows decode will read, plus
+            # the state schema the sender actually ships. Runs once per request,
+            # independently of whether DSA_TAIL is registered -- it is not for
+            # NPU MLA pools -- so a missing [P] line can no longer be confused
+            # between "tail not transferred" and "hook never called".
+            _dbg_pool = self.token_to_kv_pool_allocator.get_kvcache()
+            if getattr(_dbg_pool, "use_dsa", False):
+                _dbg_pool = _dbg_pool.full_kv_pool
+            _dbg_kv_args = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args
+            _dbg_tail_infos = getattr(_dbg_pool, "get_compress_tail_buf_infos", None)
+            try:
+                _dbg_tail = _dbg_tail_infos() if _dbg_tail_infos is not None else None
+            except Exception:  # noqa: BLE001
+                _dbg_tail = None
+            logger.info(
+                "[split-state][P] rank=%s req_row=%s seq_len=%s class=%s "
+                "state_types=%s has_dsa_tail=%s kv_item_lens=%s "
+                "state_item_lens=%s tail_entries=%s tail_item_lens=%s",
+                get_parallel().attn_cp_rank,
+                int(req.kv.req_pool_idx),
+                seq_len,
+                type(_dbg_pool).__name__,
+                [str(_st) for _st in state_types],
+                any(_st == StateType.DSA_TAIL for _st in state_types),
+                getattr(_dbg_kv_args, "kv_item_lens", None),
+                getattr(_dbg_kv_args, "state_item_lens", None),
+                None if _dbg_tail is None else len(_dbg_tail[0]),
+                None if _dbg_tail is None else list(_dbg_tail[2]),
+            )
+            dump = getattr(_dbg_pool, "_log_dsa_split_compare", None)
+            if dump is not None:
+                dump(
+                    "P",
+                    get_parallel().attn_cp_rank,
+                    self.req_to_token_pool.req_to_token[
+                        int(req.kv.req_pool_idx), :seq_len
+                    ].long(),
+                    seq_len,
+                    int(req.kv.req_pool_idx),
+                )
             payloads = {
                 StateType.MAMBA: _mamba_payload,
                 StateType.QSA_PENDING: _qsa_pending_payload,

@@ -1760,6 +1760,22 @@ class CommonKVManager(BaseKVManager):
             target_tp_ranks = list(range(info.attn_tp_size))
             required_dst_info_num = self.attn_tp_size
             required_prefill_response_num = info.attn_tp_size
+        elif (
+            self.attn_tp_size == info.attn_tp_size
+            and info.enable_dsa_cache_layer_split
+            and info.attn_tp_size > 1
+        ):
+            # DSA cache layer split scatters the layer owners over the prefill
+            # TP group. Under CP-TP group sharing the CP group IS the TP group
+            # and registers as attn_tp with attn_cp masked to 1, so a 1:1 TP
+            # pairing would leave each decode rank with only one owner's
+            # layers. Fan in over every owner, like the KV-sharding branch
+            # above. (A TP-1 layer-split prefill fans in over its CP ranks in
+            # the CP mapping below instead.)
+            target_tp_rank = None
+            target_tp_ranks = list(range(info.attn_tp_size))
+            required_dst_info_num = self.attn_tp_size
+            required_prefill_response_num = info.attn_tp_size
         elif self.attn_tp_size == info.attn_tp_size:
             target_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
             required_dst_info_num = 1

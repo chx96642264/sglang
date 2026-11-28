@@ -420,6 +420,12 @@ def maybe_prefetch_next_kimi_full_attention_kv(
         prefetch_index(layer_id, used_bound=used_bound)
 
 
+# GLM-5.3-Flash reuses Kimi's hybrid NPU prefetch under a model-agnostic name.
+maybe_prefetch_next_hybrid_full_attention_kv = (
+    maybe_prefetch_next_kimi_full_attention_kv
+)
+
+
 def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 

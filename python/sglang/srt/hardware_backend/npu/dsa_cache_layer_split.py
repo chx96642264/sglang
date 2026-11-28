@@ -62,6 +62,13 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         # First global layer index owned by this rank (used by PD transfer to
         # label the contiguous owned-buffer range).
         self.layer_shard_start = self.start_layer + self._owned_local_layer_range()[0]
+        # TEMP DEBUG: forwards walk layers in increasing order, so a non-increasing
+        # layer id in prefetch marks a new forward/request. Epoch lets the log
+        # distinguish a legitimate in-request shortcut from a stale cross-request
+        # hit on remote_kv_layer_id / remote_index_layer_id.
+        self._dbg_epoch = 0
+        self._dbg_last_prefetch_layer = -1
+        self._log_dsa_split_geometry("P", self.layer_shard_rank)
 
     def _owned_local_layer_range(self) -> tuple[int, int]:
         # host_pool_config.py addresses the split-pool root through the
@@ -119,7 +126,17 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
             layer_id: slot for slot, layer_id in enumerate(self.indexer_layer_ids)
         }
         kv_pages = self.size // self.page_size + self.kv_page_padding
-        index_pages = self.index_size // self.index_page_size + self.index_page_padding
+        # Match the base pool's page math: with NPU KPool compress
+        # (index_kpool > 1) the index cache packs index_kpool tokens per row,
+        # so one logical page holds page_size // index_kpool rows. The plain
+        # #48389 division is only equivalent at index_kpool == 1; keeping it
+        # would allocate index_kpool× the rows and report index_kpool× the
+        # per-entry transfer sizes, breaking the PD pairing against the
+        # decode-side base pool.
+        index_pages = (
+            self.index_size // (self.index_page_size * self.index_kpool)
+            + self.index_page_padding
+        )
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.k_buffer = torch.zeros(
@@ -277,16 +294,31 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         src = cp_group.ranks[owner_rank]
         if self.layer_shard_rank == owner_rank:
             k_buf = self.k_buffer[offset].view(-1, self.kv_cache_dim)[:slice_tokens]
-            v_buf = self.v_buffer[offset].view(-1, self.kr_cache_dim)[:slice_tokens]
+            v_buf = (
+                self.v_buffer[offset].view(-1, self.kr_cache_dim)[:slice_tokens]
+                if self.kr_cache_dim
+                # Nope-only MLA (e.g. GLM-5.3-Flash: qk_rope_head_dim == 0):
+                # the V/rope tail is zero-width, so there is nothing to
+                # broadcast; the finalize path already skips None handles.
+                else None
+            )
         else:
             k_buf = self.remote_k_buffer.view(-1, self.kv_cache_dim)[:slice_tokens]
-            v_buf = self.remote_v_buffer.view(-1, self.kr_cache_dim)[:slice_tokens]
+            v_buf = (
+                self.remote_v_buffer.view(-1, self.kr_cache_dim)[:slice_tokens]
+                if self.kr_cache_dim
+                else None
+            )
         return [
             torch.distributed.broadcast(
                 k_buf, src=src, group=cp_group.device_group, async_op=True
             ),
-            torch.distributed.broadcast(
-                v_buf, src=src, group=cp_group.device_group, async_op=True
+            (
+                torch.distributed.broadcast(
+                    v_buf, src=src, group=cp_group.device_group, async_op=True
+                )
+                if v_buf is not None
+                else None
             ),
         ]
 
@@ -421,7 +453,16 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         copy is discarded and the get falls back to the synchronous
         broadcast.
         """
+        if layer_id <= self._dbg_last_prefetch_layer:
+            self._dbg_epoch += 1
+        self._dbg_last_prefetch_layer = layer_id
         if self.remote_kv_layer_id == layer_id:
+            logger.info(
+                "[split-cache][P] rank=%s epoch=%s layer=%s mode=prefetch hit=True",
+                self.layer_shard_rank,
+                self._dbg_epoch,
+                layer_id,
+            )
             return
         if self.pending_remote_kv_broadcast:
             if self.pending_remote_kv_layer_id == layer_id:
@@ -445,11 +486,20 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                 set_remote_layer_id=self.pending_remote_kv_layer_id == layer_id
             )
         if self.remote_kv_layer_id == layer_id:
+            logger.info(
+                "[split-cache][P] rank=%s epoch=%s layer=%s mode=sync hit=True",
+                self.layer_shard_rank,
+                self._dbg_epoch,
+                layer_id,
+            )
             return
         # Fallback materialization: wait immediately, the caller reads the
-        # scratch right after this returns.
+        # scratch right after this returns. Zero-width handles (nope-only
+        # MLA) come back as None and are skipped, matching
+        # _finalize_pending_kv_broadcast.
         for _w in self._broadcast_kv_from_owner(layer_id, None):
-            _w.wait()
+            if _w is not None:
+                _w.wait()
         self.remote_kv_layer_id = layer_id
 
     def _ensure_remote_index_layer(self, layer_id: int) -> None:
@@ -459,6 +509,12 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                 set_remote_layer_id=False, wait_works=False
             )
         if self.remote_index_layer_id == layer_id:
+            logger.info(
+                "[split-cache][P] rank=%s epoch=%s layer=%s mode=index hit=True",
+                self.layer_shard_rank,
+                self._dbg_epoch,
+                layer_id,
+            )
             return
         if self.remote_index_k_buffer is None:
             return
@@ -592,11 +648,15 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                 loc.view(-1, 1),
                 cache_k.view(-1, 1, self.kv_lora_rank),
             )
-            torch_npu.npu_scatter_nd_update_(
-                self.remote_v_buffer.view(-1, 1, self.qk_rope_head_dim),
-                loc.view(-1, 1),
-                cache_v.view(-1, 1, self.qk_rope_head_dim),
-            )
+            # Nope-only MLA: the zero-width V/rope tail has no scatter
+            # target (view(-1, 1, 0) is ambiguous); the K rows carry all
+            # the data.
+            if self.kr_cache_dim:
+                torch_npu.npu_scatter_nd_update_(
+                    self.remote_v_buffer.view(-1, 1, self.qk_rope_head_dim),
+                    loc.view(-1, 1),
+                    cache_v.view(-1, 1, self.qk_rope_head_dim),
+                )
         self.remote_kv_layer_id = layer.layer_id
 
     def set_index_k_buffer(
@@ -695,17 +755,31 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         tgt_flat = tgt_loc.view(-1).long()
         src_flat = src_loc.view(-1).long()
         for offset in range(self.k_buffer.shape[0]):
-            self.k_buffer[offset][tgt_flat] = self.k_buffer[offset][src_flat]
-            self.v_buffer[offset][tgt_flat] = self.v_buffer[offset][src_flat]
+            # Slot locs address flat rows, matching the read path
+            # (get_mla_kv_buffer's view(-1, width).index_select).
+            self.k_buffer[offset].view(-1, 1, self.kv_cache_dim)[tgt_flat] = (
+                self.k_buffer[offset].view(-1, 1, self.kv_cache_dim)[src_flat]
+            )
+            # Nope-only MLA (e.g. GLM-5.3-Flash: qk_rope_head_dim == 0) has a
+            # zero-width V tail; view(-1, 1, 0) is ambiguous, and there is
+            # nothing to move anyway.
+            if self.kr_cache_dim:
+                self.v_buffer[offset].view(-1, 1, self.kr_cache_dim)[tgt_flat] = (
+                    self.v_buffer[offset].view(-1, 1, self.kr_cache_dim)[src_flat]
+                )
         if self.index_k_buffer is not None:
+            # Index rows are compressed by index_kpool tokens per row, so the
+            # slot locs must be translated before addressing them.
+            index_tgt = tgt_flat // self.index_kpool
+            index_src = src_flat // self.index_kpool
             for slot in range(self.index_k_buffer.shape[0]):
-                self.index_k_buffer[slot][tgt_flat] = self.index_k_buffer[slot][
-                    src_flat
-                ]
+                index_k = self.index_k_buffer[slot].view(
+                    -1, 1, self.index_head_dim
+                )
+                index_k[index_tgt] = index_k[index_src]
                 if self.index_k_scale_buffer is not None:
-                    self.index_k_scale_buffer[slot][tgt_flat] = (
-                        self.index_k_scale_buffer[slot][src_flat]
-                    )
+                    scale = self.index_k_scale_buffer[slot].view(-1, 1)
+                    scale[index_tgt] = scale[index_src]
 
     def get_kv_transfer_layer_span(self, num_entries: int) -> int:
         """Layer count covered by ``num_entries`` contiguous buf entries.

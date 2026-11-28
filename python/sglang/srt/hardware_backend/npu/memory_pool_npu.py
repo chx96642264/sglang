@@ -1369,6 +1369,108 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             2 if self.index_k_scale_buffer is not None else 1
         )
 
+    def _dsa_split_first_row(self) -> int:
+        if getattr(self, "layer_shard_enabled", False):
+            return int(self._owned_local_layer_range()[0])
+        return 0
+
+    def _log_dsa_split_geometry(self, stage: str, rank: int) -> None:
+        """TEMP DEBUG: pool geometry + PD entry sizes, comparable P vs D."""
+        try:
+            _ptrs, _nbytes, item_lens = self.get_contiguous_buf_infos()
+            tail = getattr(self, "_compress_tail_k", None)
+            idx_k = getattr(self, "index_k_buffer", None)
+            idx_s = getattr(self, "index_k_scale_buffer", None)
+            logger.info(
+                "[split-geom][%s] rank=%d class=%s start_layer=%d first_row=%d "
+                "page_size=%d kv_pages=%d k=%s v=%s idx_k=%s idx_scale=%s "
+                "index_size=%d index_page_size=%d index_kpool=%d "
+                "compress=%s tail_n=%s tail_row=%s entries=%d item_lens=%s",
+                stage,
+                int(rank),
+                type(self).__name__,
+                int(getattr(self, "start_layer", 0)),
+                self._dsa_split_first_row(),
+                int(self.page_size),
+                int(self.size // self.page_size + self.kv_page_padding),
+                tuple(self.k_buffer.shape),
+                tuple(self.v_buffer.shape)
+                if getattr(self, "v_buffer", None) is not None
+                else None,
+                tuple(idx_k.shape) if idx_k is not None else None,
+                tuple(idx_s.shape) if idx_s is not None else None,
+                int(self.index_size),
+                int(self.index_page_size),
+                int(getattr(self, "index_kpool", 1)),
+                bool(getattr(self, "kpool_use_compress", False)),
+                None if tail is None else len(tail),
+                None if not tail else tuple(tail[0].shape[1:]),
+                len(item_lens),
+                [int(x) for x in item_lens],
+            )
+        except Exception as e:  # noqa: BLE001 - debug dump must never break setup
+            logger.warning("[split-geom][%s] dump failed: %r", stage, e)
+
+    def _log_dsa_split_compare(
+        self, stage: str, rank: int, loc, seq_len: int, req_row: int
+    ) -> None:
+        """TEMP DEBUG: per-layer content digest (k / index k / index scale / tail)."""
+        try:
+            k_buffer = getattr(self, "k_buffer", None)
+            if not isinstance(k_buffer, torch.Tensor) or k_buffer.dim() != 5:
+                return
+            loc = torch.as_tensor(loc, device=k_buffer.device).long().flatten()
+            n_rows = k_buffer.shape[0]
+            k_sums = (
+                k_buffer.reshape(n_rows, -1, self.kv_cache_dim)[:, loc]
+                .float()
+                .abs()
+                .sum(-1)
+                .sum(-1)
+                .tolist()
+            )
+            idx_sums = scale_sums = None
+            idx_k = getattr(self, "index_k_buffer", None)
+            if isinstance(idx_k, torch.Tensor) and idx_k.shape[0] > 0:
+                # Index rows are compressed by index_kpool tokens per row.
+                i_loc = (loc // int(getattr(self, "index_kpool", 1))).clamp(min=0)
+                i_flat = idx_k.reshape(idx_k.shape[0], -1, self.index_head_dim)
+                idx_sums = (
+                    i_flat[:, i_loc].float().abs().sum(-1).sum(-1).tolist()
+                )
+                idx_s = getattr(self, "index_k_scale_buffer", None)
+                if isinstance(idx_s, torch.Tensor):
+                    s_flat = idx_s.reshape(idx_s.shape[0], -1, 1)
+                    scale_sums = (
+                        s_flat[:, i_loc].float().abs().sum(-1).sum(-1).tolist()
+                    )
+            tail_sums = None
+            tail = getattr(self, "_compress_tail_k", None)
+            if tail is not None:
+                tail_sums = [
+                    float(t[req_row].float().abs().sum().item())
+                    if t.shape[0] > 0
+                    else -1.0
+                    for t in tail
+                ]
+            fmt = lambda xs: None if xs is None else ["%.2f" % x for x in xs]  # noqa: E731
+            logger.info(
+                "[split-cmp][%s] rank=%d req_row=%d seq_len=%d first_row=%d "
+                "n_rows=%d k=%s idxk=%s idxs=%s tail=%s",
+                stage,
+                int(rank),
+                int(req_row),
+                int(seq_len),
+                self._dsa_split_first_row(),
+                int(n_rows),
+                fmt(k_sums),
+                fmt(idx_sums),
+                fmt(scale_sums),
+                fmt(tail_sums),
+            )
+        except Exception as e:  # noqa: BLE001 - debug dump must never break transfer
+            logger.warning("[split-cmp][%s] dump failed: %r", stage, e)
+
     def _pack_dsa_quant_kv_cache(self, cache_k, cache_v):
         latent = cache_k.reshape(-1, self.kv_lora_rank)
         quantized, scale = torch_npu.npu_dynamic_quant(

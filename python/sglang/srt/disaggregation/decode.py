@@ -3420,6 +3420,29 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return False
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
+        # TEMP DEBUG: D-side digest of the rows the first decode forward will
+        # read, plus a one-off geometry line to diff against [split-geom][P].
+        try:
+            hybrid_pool = self.tree_cache.token_to_kv_pool_allocator.get_kvcache()
+            pool = hybrid_pool
+            if getattr(pool, "use_dsa", False):
+                pool = pool.full_kv_pool
+            if not getattr(self, "_split_geom_logged", False) and hasattr(
+                pool, "_log_dsa_split_geometry"
+            ):
+                pool._log_dsa_split_geometry("D", self.tp_rank)
+                self._split_geom_logged = True
+            dump = getattr(pool, "_log_dsa_split_compare", None)
+            if dump is not None:
+                req_row = int(decode_req.req.kv.req_pool_idx)
+                seq_len = len(decode_req.req.origin_input_ids)
+                kv_idx = self.tree_cache.req_to_token_pool.req_to_token[
+                    req_row, :seq_len
+                ].long()
+                dump("D", self.tp_rank, kv_idx, seq_len, req_row)
+        except Exception as e:  # noqa: BLE001 - debug dump must never break commit
+            logger.warning("[split-cmp][D] dump failed: %r", e)
+
         # Keep the checksum before the metadata slot is freed; it is verified
         # when the request enters a batch.
         idx = decode_req.metadata_buffer_index

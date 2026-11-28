@@ -2941,6 +2941,37 @@ class KVCacheConfigurator:
             extra_args["host_to_device_ratio"] = (
                 parse_hisparse_config().host_to_device_ratio
             )
+        if _is_npu:
+            # NPU mirror of the non-hybrid path: under prefill CP layer split,
+            # the full-attention sub-pool becomes an owned-layers-only pool
+            # with owner-broadcast reads.
+            from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
+
+            dsa_cp_layer_shard_rank, dsa_cp_layer_shard_size = (
+                get_glm_dsa_cp_layer_shard_info(self)
+            )
+            if dsa_cp_layer_shard_rank is not None:
+                if get_memory().enable_hisparse:
+                    raise ValueError(
+                        "--enable-dsa-cache-layer-split is incompatible with "
+                        "--enable-hisparse for hybrid linear-attention models."
+                    )
+                if self.kv_cache_dtype == torch.int8:
+                    # Same restriction as the non-hybrid pool: the layer-split
+                    # pool allocates its indexer cache in the main KV store
+                    # dtype; the INT8 record keeps a BF16 indexer.
+                    raise ValueError(
+                        "--kv-cache-dtype int8 is not supported with "
+                        "--enable-dsa-cache-layer-split. Disable the layer split "
+                        "or use --kv-cache-dtype bf16."
+                    )
+                from sglang.srt.hardware_backend.npu.dsa_cache_layer_split import (
+                    LayerSplitNPUMLATokenToKVPool,
+                )
+
+                full_pool_class = LayerSplitNPUMLATokenToKVPool
+                extra_args["layer_shard_rank"] = dsa_cp_layer_shard_rank
+                extra_args["layer_shard_size"] = dsa_cp_layer_shard_size
         from sglang.srt.layers.attention.qsa.config import (
             parse_qsa_profile,
         )

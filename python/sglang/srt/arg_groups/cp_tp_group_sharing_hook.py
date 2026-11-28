@@ -84,8 +84,15 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             )
 
     unsupported = {
+        # GLM-5.3-Flash's hybrid DSA layer-split supports this topology too:
+        # its interleave PCP runs exactly on the shared CP/TP group and the
+        # split owner-broadcast addresses the same attn_cp_group.
         "enable-dsa-cache-layer-split": cfg.enable_dsa_cache_layer_split
-        and not (get_platform().is_npu and arch == "KimiK31ForConditionalGeneration"),
+        and not (
+            get_platform().is_npu
+            and arch
+            in ("KimiK31ForConditionalGeneration", "Glm5NextForConditionalGeneration")
+        ),
         "dcp-size > 1": cfg.dcp_size > 1,
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
